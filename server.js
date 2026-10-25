@@ -5,16 +5,87 @@ const NodeCache = require('node-cache');
 const ejs = require('ejs');
 
 const app = express();
-const cache = new NodeCache({ stdTTL: 3600 }); // كاش لحفظ بيانات السيرفرات لمدة ساعة لتسريع الفتح
+// كاش للسيرفرات (ساعة) وكاش للمباريات (دقيقة واحدة لتحديث النتائج)
+const cache = new NodeCache({ stdTTL: 3600 }); 
+const matchesCache = new NodeCache({ stdTTL: 60 }); 
 
 app.use(cors());
 
-// دوال التشفير وفك التشفير البسيطة (Base64)
+// دوال التشفير
 const encodeId = (id) => Buffer.from(id).toString('base64');
 const decodeId = (encoded) => Buffer.from(encoded, 'base64').toString('utf-8');
 
-// واجهة المشغل كاملة كمتغير نصي
-const htmlTemplate = `
+// ==========================================
+// 1. واجهة جدول المباريات (الصفحة الرئيسية)
+// ==========================================
+const indexTemplate = `
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>جدول المباريات | البث المباشر</title>
+    <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;800&display=swap" rel="stylesheet">
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Tajawal', sans-serif; }
+        body { background-color: #0f1015; color: #fff; padding: 20px; }
+        .header { text-align: center; margin-bottom: 30px; padding: 20px; background: rgba(20, 22, 32, 0.8); border-radius: 16px; border: 1px solid rgba(255, 255, 255, 0.05); }
+        .header h1 { color: #5c4dff; font-weight: 800; font-size: 28px; }
+        .matches-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 20px; max-width: 1200px; margin: 0 auto; }
+        .match-card { background: rgba(25, 27, 40, 0.9); border-radius: 16px; padding: 20px; border: 1px solid rgba(255, 255, 255, 0.1); transition: transform 0.3s, box-shadow 0.3s; text-decoration: none; color: inherit; display: block; }
+        .match-card:hover { transform: translateY(-5px); box-shadow: 0 10px 30px rgba(92, 77, 255, 0.2); border-color: rgba(92, 77, 255, 0.5); }
+        .league-name { font-size: 12px; color: #9ca3af; text-align: center; margin-bottom: 15px; border-bottom: 1px solid rgba(255,255,255,0.05); padding-bottom: 10px; }
+        .teams-container { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; }
+        .team { display: flex; flex-direction: column; align-items: center; width: 35%; text-align: center; }
+        .team img { width: 50px; height: 50px; object-fit: contain; margin-bottom: 8px; }
+        .team-name { font-size: 14px; font-weight: 700; }
+        .match-info { display: flex; flex-direction: column; align-items: center; justify-content: center; width: 30%; }
+        .score { font-size: 24px; font-weight: 800; color: #5c4dff; direction: ltr; }
+        .time { font-size: 13px; color: #ff3b30; font-weight: 700; margin-top: 5px; background: rgba(255, 59, 48, 0.1); padding: 3px 8px; border-radius: 4px; text-align: center; }
+        .channel { font-size: 12px; color: #d1d5db; text-align: center; margin-top: 15px; background: rgba(255, 255, 255, 0.05); padding: 8px; border-radius: 8px; }
+        @media (max-width: 600px) { .matches-grid { grid-template-columns: 1fr; } }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>جدول مباريات اليوم ⚽</h1>
+        <p>اختر المباراة للمشاهدة المباشرة</p>
+    </div>
+    
+    <div class="matches-grid">
+        <% if(matches && matches.length > 0) { %>
+            <% matches.forEach(match => { %>
+                <a href="/m?v=<%= match.encodedId %>" class="match-card">
+                    <div class="league-name"><%= match.league %></div>
+                    <div class="teams-container">
+                        <div class="team">
+                            <img src="<%= match.team1_logo %>" alt="<%= match.team1 %>">
+                            <span class="team-name"><%= match.team1 %></span>
+                        </div>
+                        <div class="match-info">
+                            <span class="score"><%= match.score %></span>
+                            <span class="time"><%= match.status %></span>
+                        </div>
+                        <div class="team">
+                            <img src="<%= match.team2_logo %>" alt="<%= match.team2 %>">
+                            <span class="team-name"><%= match.team2 %></span>
+                        </div>
+                    </div>
+                    <div class="channel">📺 <%= match.channel %></div>
+                </a>
+            <% }) %>
+        <% } else { %>
+            <h3 style="text-align:center; grid-column: 1 / -1;">لا توجد مباريات حالياً</h3>
+        <% } %>
+    </div>
+</body>
+</html>
+`;
+
+// ==========================================
+// 2. واجهة المشغل (مع كافة الإصلاحات)
+// ==========================================
+const playerTemplate = `
 <!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
@@ -37,7 +108,7 @@ const htmlTemplate = `
             position: absolute; top: 0; left: 0; width: 100%; height: 100%;
             background: rgba(0, 0, 0, 0.85); backdrop-filter: blur(10px);
             display: flex; flex-direction: column; justify-content: center; align-items: center;
-            z-index: 25; transition: opacity 0.3s ease;
+            z-index: 25; transition: opacity 0.3s ease; pointer-events: auto;
         }
         .spinner { width: 50px; height: 50px; border: 4px solid rgba(255, 255, 255, 0.1); border-top: 4px solid #5c4dff; border-radius: 50%; animation: spin 0.8s linear infinite; margin-bottom: 12px; }
         .loading-text { color: #fff; font-size: 15px; font-weight: 500; letter-spacing: 0.5px; }
@@ -105,7 +176,7 @@ const htmlTemplate = `
         .modal-header { display: flex; justify-content: space-between; align-items: center; }
         .modal-header h2 { font-size: 18px; font-weight: 700; }
         .close-modal { background: none; border: none; color: #d1d5db; font-size: 22px; cursor: pointer; }
-        #embedCodeArea { background-color: rgba(0,0,0,0.4); border: 1px solid rgba(255, 255, 255, 0.1); color: #a78bfa; font-family: monospace; padding: 12px; border-radius: 8px; resize: none; width: 100%; height: 100px; font-size: 12px; }
+        #embedCodeArea { background-color: rgba(0,0,0,0.4); border: 1px solid rgba(255, 255, 255, 0.1); color: #a78bfa; font-family: monospace; padding: 12px; border-radius: 8px; resize: none; width: 100%; height: 100px; font-size: 12px; direction: ltr; }
         #copyEmbedBtn { background-color: #5c4dff; color: white; border: none; padding: 10px 16px; border-radius: 8px; cursor: pointer; font-weight: 700; font-size: 14px; transition: background-color 0.2s; }
         #copyEmbedBtn:hover { background-color: #4a3be0; }
 
@@ -118,7 +189,7 @@ const htmlTemplate = `
 </head>
 <body>
     <div class="player-container" id="playerContainer">
-        <!-- شاشة التحميل -->
+        
         <div id="loadingOverlay" class="loading-overlay">
             <div class="spinner"></div>
             <div class="loading-text">جاري الاتصال بالبث المباشر...</div>
@@ -126,13 +197,11 @@ const htmlTemplate = `
 
         <video id="video" playsinline webkit-playsinline autoplay muted></video>
 
-        <!-- الشريط العلوي -->
         <div class="glass-bar title-bar" id="titleBar">
-            <a href="#" target="_blank" class="logo-text">ياسين Tv بلس</a>
+            <a href="/" class="logo-text">🏠 العودة للمباريات</a>
             <div class="video-title" dir="rtl"><%= match.title %> (<%= match.league %>)</div>
         </div>
         
-        <!-- قائمة اختيار السيرفرات -->
         <div id="serverPopup" class="server-popup">
             <div class="popup-header">
                 <div class="popup-title">
@@ -154,7 +223,6 @@ const htmlTemplate = `
             </div>
         </div>
         
-        <!-- الشريط السفلي -->
         <div class="glass-bar controls-bar" id="controlsBar">
             <div class="left-controls">
                 <div class="live-dot"></div>
@@ -174,7 +242,6 @@ const htmlTemplate = `
         </div>
     </div>
 
-    <!-- نافذة كود التضمين -->
     <div id="embedModal" class="modal">
         <div class="modal-content">
             <div class="modal-header">
@@ -204,9 +271,30 @@ const htmlTemplate = `
             }, 3000);
         }
         playerContainer.addEventListener('mousemove', resetInactivityTimer);
+        playerContainer.addEventListener('touchstart', resetInactivityTimer);
 
-        function showLoading() { document.getElementById('loadingOverlay').style.opacity = '1'; }
-        function hideLoading() { document.getElementById('loadingOverlay').style.opacity = '0'; }
+        // حل مشكلة التفاعل (مؤشر الماوس)
+        function showLoading() { 
+            const overlay = document.getElementById('loadingOverlay');
+            overlay.style.opacity = '1'; 
+            overlay.style.pointerEvents = 'auto'; 
+        }
+        function hideLoading() { 
+            const overlay = document.getElementById('loadingOverlay');
+            overlay.style.opacity = '0'; 
+            overlay.style.pointerEvents = 'none'; 
+        }
+
+        // حل مشكلة الصوت والتشغيل التلقائي
+        function attemptPlay() {
+            video.play().then(() => {
+                video.muted = false; 
+                hideLoading();
+            }).catch(() => {
+                video.muted = true; 
+                video.play().then(hideLoading).catch(hideLoading);
+            });
+        }
 
         function changeServer(serverIndex, element = null) {
             showLoading();
@@ -224,10 +312,10 @@ const htmlTemplate = `
                 hls = new Hls({ enableWorker: true, lowLatencyMode: true }); 
                 hls.loadSource(manifestUrl); 
                 hls.attachMedia(video);
-                hls.on(Hls.Events.MANIFEST_PARSED, () => { video.play().then(hideLoading).catch(hideLoading); });
+                hls.on(Hls.Events.MANIFEST_PARSED, attemptPlay);
             } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
                 video.src = manifestUrl; 
-                video.addEventListener('loadedmetadata', () => { video.play().then(hideLoading).catch(hideLoading); });
+                video.addEventListener('loadedmetadata', attemptPlay);
             }
             document.getElementById('serverPopup').style.display = 'none';
         }
@@ -240,8 +328,10 @@ const htmlTemplate = `
         const pauseIcon = document.getElementById('pauseIcon');
         const playIcon = document.getElementById('playIcon');
 
+        // تفعيل الصوت عند النقر على التشغيل
         playPauseBtn.addEventListener('click', (e) => {
             e.stopPropagation();
+            video.muted = false; 
             video.paused ? video.play() : video.pause();
         });
 
@@ -296,22 +386,55 @@ const htmlTemplate = `
 </html>
 `;
 
-// 1. مسار المشغل الرئيسي 
+// ==========================================
+// 3. مسار الصفحة الرئيسية (عرض جدول المباريات)
+// ==========================================
+app.get('/', async (req, res) => {
+    try {
+        let matches = matchesCache.get('all_matches');
+        
+        if (!matches) {
+            const response = await axios.get('https://api.kirozozo.xyz/ytvplus/mach');
+            matches = response.data.map(match => {
+                // تشفير الـ id_live لتوليد الرابط الصحيح للمشغل
+                match.encodedId = encodeId(match.id_live);
+                return match;
+            });
+            matchesCache.set('all_matches', matches);
+        }
+
+        const renderedHtml = ejs.render(indexTemplate, { matches });
+        res.send(renderedHtml);
+
+    } catch (error) {
+        console.error(error);
+        res.status(500).send("عذراً، حدث خطأ أثناء جلب جدول المباريات.");
+    }
+});
+
+// ==========================================
+// 4. مسار المشغل (لفتح مباراة معينة)
+// ==========================================
 app.get('/m', async (req, res) => {
     try {
         const encodedId = req.query.v;
-        if (!encodedId) return res.status(400).send("رابط غير صالح");
+        if (!encodedId) return res.redirect('/');
 
         const id_live = decodeId(encodedId);
 
-        // جلب بيانات المباراة
-        const matchRes = await axios.get('https://api.kirozozo.xyz/ytvplus/mach');
-        const matchInfo = matchRes.data.find(m => m.id_live === id_live) || { title: 'بث مباشر', league: '', id_live };
+        // جلب بيانات المباراة من الكاش أو الـ API
+        let matches = matchesCache.get('all_matches');
+        if (!matches) {
+            const matchRes = await axios.get('https://api.kirozozo.xyz/ytvplus/mach');
+            matches = matchRes.data;
+        }
+        const matchInfo = matches.find(m => m.id_live === id_live) || { title: 'بث مباشر', league: '', id_live };
 
         // جلب السيرفرات
         const serversRes = await axios.get(`https://api.kirozozo.xyz/ytvplus/stream?id_live=${id_live}`);
         const serversData = serversRes.data;
 
+        // معالجة بيانات السيرفرات
         const parsedServers = serversData.map((srv, index) => {
             let realUrl = "";
             let customHeaders = {};
@@ -353,19 +476,20 @@ app.get('/m', async (req, res) => {
             return { index, name: serverConfig.name };
         });
 
-        // دمج البيانات مع كود HTML باستخدام EJS
         const fullUrl = req.protocol + '://' + req.get('host') + req.originalUrl;
-        const renderedHtml = ejs.render(htmlTemplate, { match: matchInfo, servers: parsedServers, id_live, fullUrl });
+        const renderedHtml = ejs.render(playerTemplate, { match: matchInfo, servers: parsedServers, id_live, fullUrl });
         
         res.send(renderedHtml);
 
     } catch (error) {
         console.error(error);
-        res.status(500).send("حدث خطأ أثناء جلب البيانات");
+        res.status(500).send("حدث خطأ أثناء جلب بيانات المباراة.");
     }
 });
 
-// 2. مسار البروكسي لملف m3u8
+// ==========================================
+// 5. مسار البروكسي لملف m3u8
+// ==========================================
 app.get('/proxy/playlist.m3u8', async (req, res) => {
     const { id, s } = req.query; 
     const srvConfig = cache.get(`srv_${id}_${s}`);
@@ -410,7 +534,9 @@ app.get('/proxy/playlist.m3u8', async (req, res) => {
     }
 });
 
-// 3. مسار البروكسي لقطع الفيديو (ts)
+// ==========================================
+// 6. مسار البروكسي لقطع الفيديو (ts)
+// ==========================================
 app.get('/proxy/segment.ts', async (req, res) => {
     const { id, s, url } = req.query;
     const srvConfig = cache.get(`srv_${id}_${s}`);
@@ -433,8 +559,11 @@ app.get('/proxy/segment.ts', async (req, res) => {
     }
 });
 
+// ==========================================
+// تشغيل الخادم
+// ==========================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`Server is running on port ${PORT}`);
-    console.log(`Test link: http://localhost:${PORT}/m?v=${encodeId('live_tv_beinsport5')}`);
+    console.log(`Open http://localhost:${PORT} to see the Matches Schedule.`);
 });
