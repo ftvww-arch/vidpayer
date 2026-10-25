@@ -3,87 +3,85 @@ const axios = require('axios');
 const cors = require('cors');
 const NodeCache = require('node-cache');
 const ejs = require('ejs');
+const crypto = require('crypto'); // لإنشاء التوكنات الأمنية
 
 const app = express();
-// كاش للسيرفرات (ساعة) وكاش للمباريات (دقيقة واحدة لتحديث النتائج)
-const cache = new NodeCache({ stdTTL: 3600 }); 
-const matchesCache = new NodeCache({ stdTTL: 60 }); 
+
+// إعدادات الكاش
+const matchesCache = new NodeCache({ stdTTL: 60 });       // كاش للمباريات (60 ثانية لتحديث النتائج)
+const serverCache = new NodeCache({ stdTTL: 3600 });      // كاش لبيانات السيرفرات (ساعة)
+const tokenCache = new NodeCache({ stdTTL: 14400 });      // كاش للتوكنات الأمنية (4 ساعات)
 
 app.use(cors());
 
-// دوال التشفير
+// دوال التشفير الأساسية
 const encodeId = (id) => Buffer.from(id).toString('base64');
 const decodeId = (encoded) => Buffer.from(encoded, 'base64').toString('utf-8');
 
-// ==========================================
-// 1. واجهة جدول المباريات (الصفحة الرئيسية)
-// ==========================================
-const indexTemplate = `
-<!DOCTYPE html>
-<html lang="ar" dir="rtl">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>جدول المباريات | البث المباشر</title>
-    <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;800&display=swap" rel="stylesheet">
-    <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Tajawal', sans-serif; }
-        body { background-color: #0f1015; color: #fff; padding: 20px; }
-        .header { text-align: center; margin-bottom: 30px; padding: 20px; background: rgba(20, 22, 32, 0.8); border-radius: 16px; border: 1px solid rgba(255, 255, 255, 0.05); }
-        .header h1 { color: #5c4dff; font-weight: 800; font-size: 28px; }
-        .matches-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 20px; max-width: 1200px; margin: 0 auto; }
-        .match-card { background: rgba(25, 27, 40, 0.9); border-radius: 16px; padding: 20px; border: 1px solid rgba(255, 255, 255, 0.1); transition: transform 0.3s, box-shadow 0.3s; text-decoration: none; color: inherit; display: block; }
-        .match-card:hover { transform: translateY(-5px); box-shadow: 0 10px 30px rgba(92, 77, 255, 0.2); border-color: rgba(92, 77, 255, 0.5); }
-        .league-name { font-size: 12px; color: #9ca3af; text-align: center; margin-bottom: 15px; border-bottom: 1px solid rgba(255,255,255,0.05); padding-bottom: 10px; }
-        .teams-container { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; }
-        .team { display: flex; flex-direction: column; align-items: center; width: 35%; text-align: center; }
-        .team img { width: 50px; height: 50px; object-fit: contain; margin-bottom: 8px; }
-        .team-name { font-size: 14px; font-weight: 700; }
-        .match-info { display: flex; flex-direction: column; align-items: center; justify-content: center; width: 30%; }
-        .score { font-size: 24px; font-weight: 800; color: #5c4dff; direction: ltr; }
-        .time { font-size: 13px; color: #ff3b30; font-weight: 700; margin-top: 5px; background: rgba(255, 59, 48, 0.1); padding: 3px 8px; border-radius: 4px; text-align: center; }
-        .channel { font-size: 12px; color: #d1d5db; text-align: center; margin-top: 15px; background: rgba(255, 255, 255, 0.05); padding: 8px; border-radius: 8px; }
-        @media (max-width: 600px) { .matches-grid { grid-template-columns: 1fr; } }
-    </style>
-</head>
-<body>
-    <div class="header">
-        <h1>جدول مباريات اليوم ⚽</h1>
-        <p>اختر المباراة للمشاهدة المباشرة</p>
-    </div>
-    
-    <div class="matches-grid">
-        <% if(matches && matches.length > 0) { %>
-            <% matches.forEach(match => { %>
-                <a href="/m?v=<%= match.encodedId %>" class="match-card">
-                    <div class="league-name"><%= match.league %></div>
-                    <div class="teams-container">
-                        <div class="team">
-                            <img src="<%= match.team1_logo %>" alt="<%= match.team1 %>">
-                            <span class="team-name"><%= match.team1 %></span>
-                        </div>
-                        <div class="match-info">
-                            <span class="score"><%= match.score %></span>
-                            <span class="time"><%= match.status %></span>
-                        </div>
-                        <div class="team">
-                            <img src="<%= match.team2_logo %>" alt="<%= match.team2 %>">
-                            <span class="team-name"><%= match.team2 %></span>
-                        </div>
-                    </div>
-                    <div class="channel">📺 <%= match.channel %></div>
-                </a>
-            <% }) %>
-        <% } else { %>
-            <h3 style="text-align:center; grid-column: 1 / -1;">لا توجد مباريات حالياً</h3>
-        <% } %>
-    </div>
-</body>
-</html>
-`;
+// دالة إنشاء توكن أمني عشوائي
+const generateSecureToken = () => {
+    const token = crypto.randomBytes(16).toString('hex');
+    tokenCache.set(token, true); // حفظ التوكن في الكاش
+    return token;
+};
 
 // ==========================================
-// 2. واجهة المشغل (مع كافة الإصلاحات)
+// Middleware: حماية مسارات البث (Anti-Theft)
+// ==========================================
+const verifyStreamAccess = (req, res, next) => {
+    const { tk } = req.query;
+    
+    // 1. التحقق من وجود وصلاحية التوكن
+    if (!tk || !tokenCache.has(tk)) {
+        return res.status(403).json({ error: "Access Denied. Invalid or expired token." });
+    }
+
+    // 2. التحقق من مصدر الطلب (Referer) لمنع النسخ الخارجي
+    const referer = req.headers.referer || '';
+    const host = req.get('host');
+    if (referer && !referer.includes(host)) {
+        return res.status(403).json({ error: "Direct access forbidden. Please use the official player." });
+    }
+
+    next();
+};
+
+// ==========================================
+// 1. مسار الـ API (إرجاع المباريات بصيغة JSON)
+// ==========================================
+app.get('/', async (req, res) => {
+    try {
+        let matches = matchesCache.get('all_matches');
+        
+        if (!matches) {
+            const response = await axios.get('https://api.kirozozo.xyz/ytvplus/mach', { timeout: 10000 });
+            matches = response.data.map(match => {
+                const encodedId = encodeId(match.id_live);
+                return {
+                    ...match,
+                    encodedId: encodedId,
+                    // تجهيز رابط المشغل النهائي ليسهل عليك استخدامه في موقعك
+                    player_url: `${req.protocol}://${req.get('host')}/m?v=${encodedId}`
+                };
+            });
+            matchesCache.set('all_matches', matches);
+        }
+
+        res.json({
+            status: "success",
+            cached: matchesCache.getTtl('all_matches') > 0,
+            total: matches.length,
+            data: matches
+        });
+
+    } catch (error) {
+        console.error("Error fetching matches:", error.message);
+        res.status(500).json({ status: "error", message: "حدث خطأ أثناء جلب المباريات" });
+    }
+});
+
+// ==========================================
+// 2. واجهة المشغل (HTML + EJS Template)
 // ==========================================
 const playerTemplate = `
 <!DOCTYPE html>
@@ -91,95 +89,57 @@ const playerTemplate = `
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title><%= match.title %> - مشغل البث</title>
-    <link rel="preconnect" href="https://cdn.jsdelivr.net">
+    <title><%= match.title %> - بث مباشر</title>
     <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;800&display=swap" rel="stylesheet">
     <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body, html { height: 100%; width: 100%; background-color: #000; font-family: 'Tajawal', sans-serif; overflow: hidden; display: flex; justify-content: center; align-items: center; }
-        
-        .player-container {
-            position: relative; width: 100%; height: 100%; max-width: 1200px; max-height: 800px;
-            background-color: #000; overflow: hidden; cursor: default; user-select: none; -webkit-user-select: none;
-        }
-
-        .loading-overlay {
-            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
-            background: rgba(0, 0, 0, 0.85); backdrop-filter: blur(10px);
-            display: flex; flex-direction: column; justify-content: center; align-items: center;
-            z-index: 25; transition: opacity 0.3s ease; pointer-events: auto;
-        }
+        .player-container { position: relative; width: 100%; height: 100%; max-width: 1200px; max-height: 800px; background-color: #000; overflow: hidden; cursor: default; user-select: none; -webkit-user-select: none; }
+        .loading-overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0, 0, 0, 0.85); backdrop-filter: blur(10px); display: flex; flex-direction: column; justify-content: center; align-items: center; z-index: 25; transition: opacity 0.3s ease; pointer-events: auto; }
         .spinner { width: 50px; height: 50px; border: 4px solid rgba(255, 255, 255, 0.1); border-top: 4px solid #5c4dff; border-radius: 50%; animation: spin 0.8s linear infinite; margin-bottom: 12px; }
         .loading-text { color: #fff; font-size: 15px; font-weight: 500; letter-spacing: 0.5px; }
         @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-
         #video { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: contain; z-index: 2; }
-
-        .glass-bar {
-            position: absolute; left: 50%; transform: translateX(-50%); z-index: 10; height: 58px;
-            background: rgba(20, 22, 32, 0.78); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
-            border-radius: 14px; display: flex; align-items: center; justify-content: space-between;
-            padding: 0 24px; box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5); border: 1px solid rgba(255, 255, 255, 0.08);
-            transition: opacity 0.4s ease, transform 0.4s ease, display 0.2s ease;
-        }
-
+        .glass-bar { position: absolute; left: 50%; transform: translateX(-50%); z-index: 10; height: 58px; background: rgba(20, 22, 32, 0.78); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); border-radius: 14px; display: flex; align-items: center; justify-content: space-between; padding: 0 24px; box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5); border: 1px solid rgba(255, 255, 255, 0.08); transition: opacity 0.4s ease, transform 0.4s ease, display 0.2s ease; }
         .glass-bar.title-bar { width: 95%; max-width: 980px; height: 68px; top: 25px; }
         .glass-bar.controls-bar { width: 86%; max-width: 820px; bottom: 25px; }
-
         .player-container.hide-ui { cursor: none; }
         .player-container.hide-ui .glass-bar { opacity: 0; pointer-events: none; }
         .player-container.hide-ui .glass-bar.title-bar { transform: translate(-50%, -15px); }
         .player-container.hide-ui .glass-bar.controls-bar { transform: translate(-50%, 15px); }
-
-        .logo-text { color: #ffffff; font-size: 17px; font-weight: 700; text-decoration: none; transition: opacity 0.2s; letter-spacing: 0.5px; }
-        .logo-text:hover { opacity: 0.8; }
+        .logo-text { color: #ffffff; font-size: 17px; font-weight: 700; text-decoration: none; transition: opacity 0.2s; }
         .video-title { color: #e5e7eb; font-size: 15px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 65%; text-align: right; }
-
         .left-controls { display: flex; align-items: center; gap: 8px; width: 100px; }
-        .live-dot { width: 8px; height: 8px; background-color: #ff3b30; border-radius: 50%; box-shadow: 0 0 8px rgba(255, 59, 48, 0.8); }
+        .live-dot { width: 8px; height: 8px; background-color: #ff3b30; border-radius: 50%; box-shadow: 0 0 8px rgba(255, 59, 48, 0.8); animation: pulse 2s infinite; }
+        @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(255, 59, 48, 0.7); } 70% { box-shadow: 0 0 0 10px rgba(255, 59, 48, 0); } 100% { box-shadow: 0 0 0 0 rgba(255, 59, 48, 0); } }
         .live-text { color: #ffffff; font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; }
-
         .center-controls { position: absolute; left: 50%; transform: translateX(-50%); display: flex; justify-content: center; align-items: center; }
         .play-pause-btn { width: 44px; height: 44px; background-color: #5c4dff; border: none; border-radius: 50%; display: flex; justify-content: center; align-items: center; cursor: pointer; transition: transform 0.2s ease, background-color 0.2s; box-shadow: 0 4px 12px rgba(92, 77, 255, 0.4); }
         .play-pause-btn:hover { transform: scale(1.1); background-color: #4a3be0; }
         .play-pause-icon { fill: #ffffff; width: 18px; height: 18px; }
-
         .right-controls { display: flex; align-items: center; gap: 18px; width: 130px; justify-content: flex-end; }
         .control-icon-btn { background: none; border: none; cursor: pointer; display: flex; justify-content: center; align-items: center; opacity: 0.8; transition: opacity 0.2s, transform 0.2s; }
         .control-icon-btn:hover { opacity: 1; transform: scale(1.1); }
         .icon-svg { fill: #d1d5db; width: 20px; height: 20px; }
-
         .server-popup { display: none; position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 90%; max-width: 340px; background: rgba(20, 22, 35, 0.96); backdrop-filter: blur(16px); border-radius: 16px; border: 1px solid rgba(255, 255, 255, 0.12); color: white; z-index: 100; padding: 20px; box-shadow: 0 20px 50px rgba(0, 0, 0, 0.8); }
         .popup-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 14px; border-bottom: 1px solid rgba(255, 255, 255, 0.1); padding-bottom: 10px; }
         .popup-title { display: flex; flex-direction: column; }
         .popup-title .en { font-size: 11px; color: #9ca3af; text-transform: uppercase; font-weight: 500; }
         .popup-title .ar { font-size: 14px; font-weight: 700; margin-top: 2px; }
         .close-server-popup { background: none; border: none; color: #9ca3af; font-size: 20px; cursor: pointer; }
-        .close-server-popup:hover { color: #ffffff; }
-
         .server-list { display: flex; flex-direction: column; gap: 6px; max-height: 250px; overflow-y: auto; }
         .server-item { display: flex; justify-content: space-between; align-items: center; padding: 10px 14px; border-radius: 10px; cursor: pointer; transition: background-color 0.2s; }
         .server-item:hover { background-color: rgba(255, 255, 255, 0.08); }
         .server-item.active { background-color: rgba(92, 77, 255, 0.3); border: 1px solid rgba(92, 77, 255, 0.4); }
         .server-info { display: flex; flex-direction: column; }
         .server-info .en { font-size: 13px; font-weight: 500; }
-        .server-info .ar { font-size: 12px; color: #9ca3af; margin-top: 2px; font-weight: 500; }
+        .server-info .ar { font-size: 12px; color: #9ca3af; margin-top: 2px; }
         .server-item.active .server-info .en, .server-item.active .server-info .ar { color: #ffffff; }
         .check-icon { width: 18px; height: 18px; fill: #5c4dff; display: none; }
         .signal-icon { width: 16px; height: 16px; fill: #9ca3af; }
         .server-item.active .check-icon { display: block; }
         .server-item.active .signal-icon { display: none; }
-
-        .modal { display: none; position: fixed; z-index: 150; left: 0; top: 0; width: 100%; height: 100%; background-color: rgba(0,0,0,0.8); justify-content: center; align-items: center; backdrop-filter: blur(8px); }
-        .modal-content { background-color: rgba(25, 27, 40, 0.95); border-radius: 16px; padding: 24px; width: 90%; max-width: 500px; border: 1px solid rgba(255, 255, 255, 0.1); color: white; display: flex; flex-direction: column; gap: 16px; }
-        .modal-header { display: flex; justify-content: space-between; align-items: center; }
-        .modal-header h2 { font-size: 18px; font-weight: 700; }
-        .close-modal { background: none; border: none; color: #d1d5db; font-size: 22px; cursor: pointer; }
-        #embedCodeArea { background-color: rgba(0,0,0,0.4); border: 1px solid rgba(255, 255, 255, 0.1); color: #a78bfa; font-family: monospace; padding: 12px; border-radius: 8px; resize: none; width: 100%; height: 100px; font-size: 12px; direction: ltr; }
-        #copyEmbedBtn { background-color: #5c4dff; color: white; border: none; padding: 10px 16px; border-radius: 8px; cursor: pointer; font-weight: 700; font-size: 14px; transition: background-color 0.2s; }
-        #copyEmbedBtn:hover { background-color: #4a3be0; }
-
         @media (max-width: 768px) {
             .glass-bar.title-bar { width: 96%; padding: 0 16px; top: 15px; }
             .glass-bar.controls-bar { width: 92%; padding: 0 16px; bottom: 15px; }
@@ -189,24 +149,23 @@ const playerTemplate = `
 </head>
 <body>
     <div class="player-container" id="playerContainer">
-        
         <div id="loadingOverlay" class="loading-overlay">
             <div class="spinner"></div>
-            <div class="loading-text">جاري الاتصال بالبث المباشر...</div>
+            <div class="loading-text">جاري الاتصال بالبث...</div>
         </div>
 
         <video id="video" playsinline webkit-playsinline autoplay muted></video>
 
         <div class="glass-bar title-bar" id="titleBar">
-            <a href="/" class="logo-text">🏠 العودة للمباريات</a>
+            <span class="logo-text">ياسين Tv بلس</span>
             <div class="video-title" dir="rtl"><%= match.title %> (<%= match.league %>)</div>
         </div>
         
         <div id="serverPopup" class="server-popup">
             <div class="popup-header">
                 <div class="popup-title">
-                    <span class="en">STREAM SERVER SELECTION</span>
-                    <span class="ar" dir="rtl">اختر الخادم للبث المباشر</span>
+                    <span class="en">SERVER SELECTION</span>
+                    <span class="ar" dir="rtl">اختر الخادم</span>
                 </div>
                 <button class="close-server-popup" id="closeServerPopup">&times;</button>
             </div>
@@ -235,21 +194,9 @@ const playerTemplate = `
                 </button>
             </div>
             <div class="right-controls">
-                <button class="control-icon-btn" id="embedBtn"><svg class="icon-svg" viewBox="0 0 24 24"><path d="M8.293 6.293a1 1 0 0 1 1.414 0L14.414 11H19a1 1 0 0 1 0 2h-4.586l-4.707 4.707a1 1 0 0 1-1.414-1.414L11.586 13H5a1 1 0 0 1 0-2h6.586L8.293 7.707a1 1 0 0 1 0-1.414z"/><path d="M19 19a1 1 0 1 1-2 0V5a1 1 0 0 1 2 0v14z"/></svg></button>
                 <button class="control-icon-btn" id="settingsBtn"><svg class="icon-svg" viewBox="0 0 24 24"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 0 0 .12-.61l-1.92-3.32a.488.488 0 0 0-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 0 0-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58a.49.49 0 0 0-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/></svg></button>
                 <button class="control-icon-btn" id="fullscreenBtn"><svg class="icon-svg" viewBox="0 0 24 24"><path d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z"/></svg></button>
             </div>
-        </div>
-    </div>
-
-    <div id="embedModal" class="modal">
-        <div class="modal-content">
-            <div class="modal-header">
-                <h2>Embed Code / كود التضمين</h2>
-                <button class="close-modal" id="closeEmbedModal">&times;</button>
-            </div>
-            <textarea id="embedCodeArea" readonly><iframe src="<%= fullUrl %>" width="100%" height="500" frameborder="0" allowfullscreen></iframe></textarea>
-            <button id="copyEmbedBtn">Copy Code / نسخ الكود</button>
         </div>
     </div>
 
@@ -257,8 +204,8 @@ const playerTemplate = `
         const video = document.getElementById('video');
         const playerContainer = document.getElementById('playerContainer');
         const id_live = "<%= id_live %>";
+        const token = "<%= token %>"; // توكن الحماية الجلسة الحالية
         let hls = null;
-        let isPlaying = true;
         let inactivityTimeout;
 
         function resetInactivityTimer() {
@@ -273,46 +220,52 @@ const playerTemplate = `
         playerContainer.addEventListener('mousemove', resetInactivityTimer);
         playerContainer.addEventListener('touchstart', resetInactivityTimer);
 
-        // حل مشكلة التفاعل (مؤشر الماوس)
-        function showLoading() { 
-            const overlay = document.getElementById('loadingOverlay');
-            overlay.style.opacity = '1'; 
-            overlay.style.pointerEvents = 'auto'; 
-        }
-        function hideLoading() { 
-            const overlay = document.getElementById('loadingOverlay');
-            overlay.style.opacity = '0'; 
-            overlay.style.pointerEvents = 'none'; 
-        }
+        function showLoading() { document.getElementById('loadingOverlay').style.opacity = '1'; document.getElementById('loadingOverlay').style.pointerEvents = 'auto'; }
+        function hideLoading() { document.getElementById('loadingOverlay').style.opacity = '0'; document.getElementById('loadingOverlay').style.pointerEvents = 'none'; }
 
-        // حل مشكلة الصوت والتشغيل التلقائي
         function attemptPlay() {
-            video.play().then(() => {
-                video.muted = false; 
-                hideLoading();
-            }).catch(() => {
-                video.muted = true; 
-                video.play().then(hideLoading).catch(hideLoading);
-            });
+            video.play().then(() => { video.muted = false; hideLoading(); }).catch(() => { video.muted = true; video.play().then(hideLoading).catch(hideLoading); });
         }
 
         function changeServer(serverIndex, element = null) {
             showLoading();
-            
             if(element) {
                 document.querySelectorAll('.server-item').forEach(el => el.classList.remove('active'));
                 element.classList.add('active');
             }
 
-            const manifestUrl = \`/proxy/playlist.m3u8?id=\${id_live}&s=\${serverIndex}\`;
+            // إضافة التوكن السري (tk) للرابط لفك الحماية
+            const manifestUrl = \`/proxy/playlist.m3u8?id=\${id_live}&s=\${serverIndex}&tk=\${token}\`;
 
             if (hls) { hls.destroy(); hls = null; }
             
             if (Hls.isSupported()) {
-                hls = new Hls({ enableWorker: true, lowLatencyMode: true }); 
+                hls = new Hls({ 
+                    enableWorker: true, lowLatencyMode: true,
+                    // إعدادات لمعالجة الأخطاء الذاتية وتخطي التقطيع
+                    fragLoadingTimeOut: 15000, manifestLoadingTimeOut: 15000
+                }); 
                 hls.loadSource(manifestUrl); 
                 hls.attachMedia(video);
+                
                 hls.on(Hls.Events.MANIFEST_PARSED, attemptPlay);
+                
+                // الاسترداد التلقائي في حال حدوث خطأ في البث
+                hls.on(Hls.Events.ERROR, function (event, data) {
+                    if (data.fatal) {
+                        switch (data.type) {
+                            case Hls.ErrorTypes.NETWORK_ERROR:
+                                hls.startLoad(); // إعادة التحميل عند خطأ الشبكة
+                                break;
+                            case Hls.ErrorTypes.MEDIA_ERROR:
+                                hls.recoverMediaError(); // إصلاح أخطاء الميديا
+                                break;
+                            default:
+                                hls.destroy();
+                                break;
+                        }
+                    }
+                });
             } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
                 video.src = manifestUrl; 
                 video.addEventListener('loadedmetadata', attemptPlay);
@@ -320,29 +273,15 @@ const playerTemplate = `
             document.getElementById('serverPopup').style.display = 'none';
         }
 
-        <% if (servers.length > 0) { %>
-            changeServer(0);
-        <% } %>
+        <% if (servers.length > 0) { %> changeServer(0); <% } %>
 
         const playPauseBtn = document.getElementById('playPauseBtn');
         const pauseIcon = document.getElementById('pauseIcon');
         const playIcon = document.getElementById('playIcon');
 
-        // تفعيل الصوت عند النقر على التشغيل
-        playPauseBtn.addEventListener('click', (e) => {
-            e.stopPropagation();
-            video.muted = false; 
-            video.paused ? video.play() : video.pause();
-        });
-
-        video.addEventListener('play', () => { 
-            isPlaying = true; pauseIcon.style.display = 'block'; playIcon.style.display = 'none'; resetInactivityTimer(); 
-        });
-        
-        video.addEventListener('pause', () => { 
-            isPlaying = false; pauseIcon.style.display = 'none'; playIcon.style.display = 'block'; 
-            playerContainer.classList.remove('hide-ui'); clearTimeout(inactivityTimeout); 
-        });
+        playPauseBtn.addEventListener('click', (e) => { e.stopPropagation(); video.muted = false; video.paused ? video.play() : video.pause(); });
+        video.addEventListener('play', () => { pauseIcon.style.display = 'block'; playIcon.style.display = 'none'; resetInactivityTimer(); });
+        video.addEventListener('pause', () => { pauseIcon.style.display = 'none'; playIcon.style.display = 'block'; playerContainer.classList.remove('hide-ui'); clearTimeout(inactivityTimeout); });
 
         document.getElementById('fullscreenBtn').addEventListener('click', (e) => {
             e.stopPropagation();
@@ -356,150 +295,105 @@ const playerTemplate = `
         });
 
         const serverPopup = document.getElementById('serverPopup');
-        const settingsBtn = document.getElementById('settingsBtn');
-        
-        settingsBtn.addEventListener('click', (e) => {
-            e.stopPropagation();
-            serverPopup.style.display = serverPopup.style.display === 'block' ? 'none' : 'block';
-        });
-        
+        document.getElementById('settingsBtn').addEventListener('click', (e) => { e.stopPropagation(); serverPopup.style.display = serverPopup.style.display === 'block' ? 'none' : 'block'; });
         document.getElementById('closeServerPopup').addEventListener('click', () => serverPopup.style.display = 'none');
-
-        const embedModal = document.getElementById('embedModal');
-        document.getElementById('embedBtn').addEventListener('click', () => embedModal.style.display = 'flex');
-        document.getElementById('closeEmbedModal').addEventListener('click', () => embedModal.style.display = 'none');
-        document.getElementById('copyEmbedBtn').addEventListener('click', () => {
-            document.getElementById('embedCodeArea').select(); 
-            document.execCommand('copy'); 
-            alert('تم نسخ كود التضمين!'); 
-            embedModal.style.display = 'none';
-        });
-
-        window.addEventListener('click', (event) => {
-            if (event.target == embedModal) embedModal.style.display = 'none';
-            if (serverPopup.style.display === 'block' && !serverPopup.contains(event.target) && event.target !== settingsBtn) {
-                serverPopup.style.display = 'none';
-            }
-        });
     </script>
 </body>
 </html>
 `;
 
 // ==========================================
-// 3. مسار الصفحة الرئيسية (عرض جدول المباريات)
-// ==========================================
-app.get('/', async (req, res) => {
-    try {
-        let matches = matchesCache.get('all_matches');
-        
-        if (!matches) {
-            const response = await axios.get('https://api.kirozozo.xyz/ytvplus/mach');
-            matches = response.data.map(match => {
-                // تشفير الـ id_live لتوليد الرابط الصحيح للمشغل
-                match.encodedId = encodeId(match.id_live);
-                return match;
-            });
-            matchesCache.set('all_matches', matches);
-        }
-
-        const renderedHtml = ejs.render(indexTemplate, { matches });
-        res.send(renderedHtml);
-
-    } catch (error) {
-        console.error(error);
-        res.status(500).send("عذراً، حدث خطأ أثناء جلب جدول المباريات.");
-    }
-});
-
-// ==========================================
-// 4. مسار المشغل (لفتح مباراة معينة)
+// 3. مسار المشغل (فتح المباراة وتوليد التوكن)
 // ==========================================
 app.get('/m', async (req, res) => {
     try {
         const encodedId = req.query.v;
-        if (!encodedId) return res.redirect('/');
+        if (!encodedId) return res.status(400).send("Invalid Request");
 
         const id_live = decodeId(encodedId);
 
-        // جلب بيانات المباراة من الكاش أو الـ API
+        // جلب بيانات المباراة
         let matches = matchesCache.get('all_matches');
         if (!matches) {
-            const matchRes = await axios.get('https://api.kirozozo.xyz/ytvplus/mach');
+            const matchRes = await axios.get('https://api.kirozozo.xyz/ytvplus/mach', { timeout: 10000 });
             matches = matchRes.data;
         }
         const matchInfo = matches.find(m => m.id_live === id_live) || { title: 'بث مباشر', league: '', id_live };
 
-        // جلب السيرفرات
-        const serversRes = await axios.get(`https://api.kirozozo.xyz/ytvplus/stream?id_live=${id_live}`);
-        const serversData = serversRes.data;
+        // جلب وتجهيز السيرفرات (كاش لمدة ساعة)
+        let parsedServers = serverCache.get(`servers_${id_live}`);
+        if (!parsedServers) {
+            const serversRes = await axios.get(`https://api.kirozozo.xyz/ytvplus/stream?id_live=${id_live}`, { timeout: 10000 });
+            
+            parsedServers = serversRes.data.map((srv, index) => {
+                let realUrl = "";
+                let customHeaders = {};
+                let swapKey = null;
+                let swapVal = null;
+                let userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)";
 
-        // معالجة بيانات السيرفرات
-        const parsedServers = serversData.map((srv, index) => {
-            let realUrl = "";
-            let customHeaders = {};
-            let swapKey = null;
-            let swapVal = null;
-            let userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)";
+                try {
+                    if (srv.data.url.startsWith('{') && srv.data.url.endsWith('}')) {
+                        const nestedObj = JSON.parse(srv.data.url);
+                        realUrl = nestedObj.url;
+                        if (nestedObj.agent) userAgent = nestedObj.agent;
+                        if (nestedObj.swap) {
+                            swapKey = Object.keys(nestedObj.swap)[0];
+                            swapVal = nestedObj.swap[swapKey];
+                        }
+                        if (nestedObj.headers) customHeaders = { ...nestedObj.headers };
+                    } else {
+                        realUrl = srv.data.url;
+                    }
 
-            try {
-                if (srv.data.url.startsWith('{') && srv.data.url.endsWith('}')) {
-                    const nestedObj = JSON.parse(srv.data.url);
-                    realUrl = nestedObj.url;
-                    if (nestedObj.agent) userAgent = nestedObj.agent;
-                    
-                    if (nestedObj.swap) {
-                        swapKey = Object.keys(nestedObj.swap)[0];
-                        swapVal = nestedObj.swap[swapKey];
+                    if (!customHeaders['User-Agent']) customHeaders['User-Agent'] = userAgent;
+                    if (realUrl) {
+                        const parsedUrl = new URL(realUrl);
+                        const origin = `${parsedUrl.protocol}//${parsedUrl.host}`;
+                        if (!customHeaders['Referer']) customHeaders['Referer'] = origin + '/';
+                        if (!customHeaders['Origin']) customHeaders['Origin'] = origin;
                     }
-                    if (nestedObj.headers) {
-                        customHeaders = { ...nestedObj.headers };
-                    }
-                } else {
+                } catch (e) {
                     realUrl = srv.data.url;
                 }
 
-                if (!customHeaders['User-Agent']) customHeaders['User-Agent'] = userAgent;
+                // الكاش لبيانات السيرفر الداخلية فقط لكي يقرأها البروكسي
+                const serverConfig = { realUrl, customHeaders, swapKey, swapVal, name: srv.name || `سيرفر ${index + 1}` };
+                serverCache.set(`srv_${id_live}_${index}`, serverConfig); 
+                
+                return { index, name: serverConfig.name };
+            });
+            
+            serverCache.set(`servers_${id_live}`, parsedServers);
+        }
 
-                if (realUrl) {
-                    const parsedUrl = new URL(realUrl);
-                    const origin = `${parsedUrl.protocol}//${parsedUrl.host}`;
-                    if (!customHeaders['Referer']) customHeaders['Referer'] = origin + '/';
-                    if (!customHeaders['Origin']) customHeaders['Origin'] = origin;
-                }
-            } catch (e) {
-                realUrl = srv.data.url;
-            }
+        // إنشاء توكن حماية مخصص لهذا المستخدم
+        const secureToken = generateSecureToken();
 
-            const serverConfig = { realUrl, customHeaders, swapKey, swapVal, name: srv.name || `سيرفر ${index + 1}` };
-            cache.set(`srv_${id_live}_${index}`, serverConfig); 
-            return { index, name: serverConfig.name };
-        });
-
-        const fullUrl = req.protocol + '://' + req.get('host') + req.originalUrl;
-        const renderedHtml = ejs.render(playerTemplate, { match: matchInfo, servers: parsedServers, id_live, fullUrl });
-        
+        const renderedHtml = ejs.render(playerTemplate, { match: matchInfo, servers: parsedServers, id_live, token: secureToken });
         res.send(renderedHtml);
 
     } catch (error) {
         console.error(error);
-        res.status(500).send("حدث خطأ أثناء جلب بيانات المباراة.");
+        res.status(500).send("حدث خطأ أثناء الاتصال بالخادم.");
     }
 });
 
 // ==========================================
-// 5. مسار البروكسي لملف m3u8
+// 4. مسار البروكسي المحمي لملف (M3U8)
+// ملاحظة: يستخدم verifyStreamAccess للتحقق من التوكن والـ Referer
 // ==========================================
-app.get('/proxy/playlist.m3u8', async (req, res) => {
-    const { id, s } = req.query; 
-    const srvConfig = cache.get(`srv_${id}_${s}`);
+app.get('/proxy/playlist.m3u8', verifyStreamAccess, async (req, res) => {
+    const { id, s, tk } = req.query; 
+    const srvConfig = serverCache.get(`srv_${id}_${s}`);
     
     if (!srvConfig || !srvConfig.realUrl) return res.status(404).send("Server not found");
 
     try {
         const response = await axios.get(srvConfig.realUrl, { 
             headers: srvConfig.customHeaders,
-            responseType: 'text'
+            responseType: 'text',
+            timeout: 10000
         });
 
         let m3u8 = response.data;
@@ -513,12 +407,11 @@ app.get('/proxy/playlist.m3u8', async (req, res) => {
                 if (!segmentUrl.startsWith('http')) {
                     segmentUrl = baseUrl + segmentUrl;
                 }
-                
                 if (srvConfig.swapKey && srvConfig.swapVal !== null && segmentUrl.includes(srvConfig.swapKey)) {
                     segmentUrl = segmentUrl.replace(srvConfig.swapKey, srvConfig.swapVal);
                 }
-
-                return `/proxy/segment.ts?id=${id}&s=${s}&url=${encodeURIComponent(segmentUrl)}`;
+                // تمرير التوكن (tk) أيضاً لملفات الأجزاء لضمان استمرار الحماية
+                return `/proxy/segment.ts?id=${id}&s=${s}&tk=${tk}&url=${encodeURIComponent(segmentUrl)}`;
             }
             return line;
         });
@@ -535,18 +428,19 @@ app.get('/proxy/playlist.m3u8', async (req, res) => {
 });
 
 // ==========================================
-// 6. مسار البروكسي لقطع الفيديو (ts)
+// 5. مسار البروكسي المحمي لقطع الفيديو (TS)
 // ==========================================
-app.get('/proxy/segment.ts', async (req, res) => {
+app.get('/proxy/segment.ts', verifyStreamAccess, async (req, res) => {
     const { id, s, url } = req.query;
-    const srvConfig = cache.get(`srv_${id}_${s}`);
+    const srvConfig = serverCache.get(`srv_${id}_${s}`);
     
     if (!srvConfig) return res.status(404).send();
 
     try {
         const response = await axios.get(decodeURIComponent(url), {
             headers: srvConfig.customHeaders,
-            responseType: 'stream'
+            responseType: 'stream',
+            timeout: 15000 // وقت أطول لانتظار قطعة الفيديو
         });
 
         res.set({
@@ -564,6 +458,7 @@ app.get('/proxy/segment.ts', async (req, res) => {
 // ==========================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(`Server is running on port ${PORT}`);
-    console.log(`Open http://localhost:${PORT} to see the Matches Schedule.`);
+    console.log(`Server running on port ${PORT}`);
+    console.log(`- API Matches: http://localhost:${PORT}/`);
+    console.log(`- Test Player: http://localhost:${PORT}/m?v=${encodeId('live_tv_beinsport5')}`);
 });
