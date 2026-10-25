@@ -6,7 +6,6 @@ const ejs = require('ejs');
 const crypto = require('crypto');
 
 const app = express();
-app.set('trust proxy', 1); // ضروري جداً ليعمل بروتوكول HTTPS بشكل صحيح على Render ولحل مشكلة الشاشة السوداء
 
 const matchesCache = new NodeCache({ stdTTL: 60 });
 const serverCache = new NodeCache({ stdTTL: 3600 });
@@ -14,7 +13,7 @@ const tokenCache = new NodeCache({ stdTTL: 14400 });
 
 app.use(cors());
 
-// السماح بعرض الموقع داخل iframe بدون قيود ومن أي نطاق
+// ميدل وير لفرض السماح بتضمين الموقع داخل iframe في أي نطاق خارجي
 app.use((req, res, next) => {
     res.removeHeader('X-Frame-Options');
     res.setHeader('Content-Security-Policy', "frame-ancestors *");
@@ -30,7 +29,7 @@ const generateSecureToken = () => {
     return token;
 };
 
-// دالة الجلب مع الرابط الاحتياطي تلقائياً
+// دالة الجلب مع الرابط الاحتياطي
 async function fetchWithFallback(path) {
     try {
         return await axios.get(`https://api.kirozozo.xyz${path}`, { timeout: 8000 });
@@ -50,7 +49,7 @@ const verifyStreamAccess = (req, res, next) => {
 };
 
 // ==========================================
-// 1. مسار الـ API (إرجاع جدول المباريات JSON بدون id_live و date)
+// 1. مسار الـ API (تصفية البيانات وإرجاع JSON)
 // ==========================================
 app.get('/', async (req, res) => {
     try {
@@ -62,10 +61,8 @@ app.get('/', async (req, res) => {
                 const encodedId = encodeId(match.id_live);
                 const cleanedMatch = {
                     ...match,
-                    // فرض https لكي يفتح الـ iframe بدون مشاكل شاشة سوداء
-                    player_url: `https://${req.get('host')}/m?v=${encodedId}`
+                    player_url: `${req.protocol}://${req.get('host')}/m?v=${encodedId}`
                 };
-                // حذف الحساسة أو غير المطلوبة
                 delete cleanedMatch.id_live;
                 delete cleanedMatch.date;
                 return cleanedMatch;
@@ -105,7 +102,6 @@ const playerTemplate = `
         .loading-text { color: #fff; font-size: 15px; font-weight: 500; }
         @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
         
-        /* زر تشغيل الصوت الإجباري */
         .unmute-overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0, 0, 0, 0.4); z-index: 20; display: none; flex-direction: column; justify-content: center; align-items: center; cursor: pointer; backdrop-filter: blur(2px); }
         .unmute-btn { background: rgba(92, 77, 255, 0.9); border-radius: 50%; width: 70px; height: 70px; display: flex; justify-content: center; align-items: center; margin-bottom: 15px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); transition: transform 0.2s; animation: pulse 2s infinite; }
         .unmute-overlay:hover .unmute-btn { transform: scale(1.1); }
@@ -165,7 +161,6 @@ const playerTemplate = `
             <div class="loading-text">جاري الاتصال بالبث...</div>
         </div>
 
-        <!-- زر تفعيل الصوت الإجباري -->
         <div id="unmuteOverlay" class="unmute-overlay">
             <div class="unmute-btn">
                 <svg viewBox="0 0 24 24" width="36" height="36" fill="white"><path d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06c1.38-.31 2.63-.95 3.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z"/></svg>
@@ -215,6 +210,7 @@ const playerTemplate = `
         </div>
     </div>
 
+    <!-- كود التضمين مع صلاحيات iframe لتشغيل الفيديو والصوت -->
     <div id="embedModal" class="modal">
         <div class="modal-content">
             <div class="modal-header">
@@ -247,7 +243,7 @@ const playerTemplate = `
         playerContainer.addEventListener('mousemove', resetInactivityTimer);
         playerContainer.addEventListener('touchstart', resetInactivityTimer);
 
-        // النقر المزدوج لتكبير أو تصغير الشاشة
+        // وظيفة النقر المزدوج لتكبير/تصغير الشاشة
         playerContainer.addEventListener('dblclick', (e) => {
             e.stopPropagation();
             toggleFullscreen();
@@ -289,7 +285,7 @@ const playerTemplate = `
                 element.classList.add('active');
             }
 
-            const manifestUrl = `/proxy/playlist.m3u8?id=${id_live}&s=${serverIndex}&tk=${token}`;
+            const manifestUrl = \`/proxy/playlist.m3u8?id=\${id_live}&s=\${serverIndex}&tk=\${token}\`;
 
             if (hls) { hls.destroy(); hls = null; }
             
@@ -363,7 +359,7 @@ app.get('/m', async (req, res) => {
             matches = matchRes.data;
         }
         
-        const matchInfo = matches.find(m => m.id_live === id_live) || { team1: 'الفريق الأول', team2: 'الفريق الثاني', title: 'بث مباشر' };
+        const matchInfo = matches.find(m => m.id_live === id_live) || { team1: 'الفريق الأول', team2: 'الفريق الثاني', title: 'بث مباشر', time: '' };
 
         let parsedServers = serverCache.get(`servers_${id_live}`);
         if (!parsedServers) {
@@ -405,8 +401,7 @@ app.get('/m', async (req, res) => {
         }
 
         const secureToken = generateSecureToken();
-        // ضمان توليد رابط https حصراً لتجنب الحظر في الـ iframe
-        const fullUrl = `https://${req.get('host')}${req.originalUrl}`;
+        const fullUrl = `${req.protocol}://${req.get('host')}${req.originalUrl}`;
         const renderedHtml = ejs.render(playerTemplate, { match: matchInfo, servers: parsedServers, id_live, token: secureToken, fullUrl });
         res.send(renderedHtml);
 
