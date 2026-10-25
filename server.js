@@ -13,6 +13,13 @@ const tokenCache = new NodeCache({ stdTTL: 14400 });
 
 app.use(cors());
 
+// ميدل وير لفرض السماح بتضمين الموقع داخل iframe في أي نطاق خارجي
+app.use((req, res, next) => {
+    res.removeHeader('X-Frame-Options');
+    res.setHeader('Content-Security-Policy', "frame-ancestors *");
+    next();
+});
+
 const encodeId = (id) => Buffer.from(id).toString('base64');
 const decodeId = (encoded) => Buffer.from(encoded, 'base64').toString('utf-8');
 
@@ -32,11 +39,11 @@ async function fetchWithFallback(path) {
     }
 }
 
-// ميدل وير لحماية مسارات البث (يسمح بالـ Iframe بفضل إزالة شرط الـ Host)
+// حماية مسارات البث
 const verifyStreamAccess = (req, res, next) => {
     const { tk } = req.query;
     if (!tk || !tokenCache.has(tk)) {
-        return res.status(403).json({ error: "Access Denied. Invalid or expired token." });
+        return res.status(403).json({ error: "Access Denied. Invalid token." });
     }
     next();
 };
@@ -56,7 +63,6 @@ app.get('/', async (req, res) => {
                     ...match,
                     player_url: `${req.protocol}://${req.get('host')}/m?v=${encodedId}`
                 };
-                // حذف البيانات غير المطلوبة
                 delete cleanedMatch.id_live;
                 delete cleanedMatch.date;
                 return cleanedMatch;
@@ -70,7 +76,6 @@ app.get('/', async (req, res) => {
             total: matches.length,
             data: matches
         });
-
     } catch (error) {
         res.status(500).json({ status: "error", message: "حدث خطأ أثناء جلب المباريات" });
     }
@@ -85,7 +90,7 @@ const playerTemplate = `
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title><%= match.title %> - بث مباشر</title>
+    <title><%= match.team1 %> ضد <%= match.team2 %> - بث مباشر</title>
     <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;800&display=swap" rel="stylesheet">
     <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
     <style>
@@ -137,6 +142,15 @@ const playerTemplate = `
         .signal-icon { width: 16px; height: 16px; fill: #9ca3af; }
         .server-item.active .check-icon { display: block; }
         .server-item.active .signal-icon { display: none; }
+        
+        .modal { display: none; position: fixed; z-index: 150; left: 0; top: 0; width: 100%; height: 100%; background-color: rgba(0,0,0,0.8); justify-content: center; align-items: center; backdrop-filter: blur(8px); }
+        .modal-content { background-color: rgba(25, 27, 40, 0.95); border-radius: 16px; padding: 24px; width: 90%; max-width: 500px; border: 1px solid rgba(255, 255, 255, 0.1); color: white; display: flex; flex-direction: column; gap: 16px; }
+        .modal-header { display: flex; justify-content: space-between; align-items: center; }
+        .modal-header h2 { font-size: 18px; font-weight: 700; }
+        .close-modal { background: none; border: none; color: #d1d5db; font-size: 22px; cursor: pointer; }
+        #embedCodeArea { background-color: rgba(0,0,0,0.4); border: 1px solid rgba(255, 255, 255, 0.1); color: #a78bfa; font-family: monospace; padding: 12px; border-radius: 8px; resize: none; width: 100%; height: 100px; font-size: 12px; direction: ltr; }
+        #copyEmbedBtn { background-color: #5c4dff; color: white; border: none; padding: 10px 16px; border-radius: 8px; cursor: pointer; font-weight: 700; font-size: 14px; transition: background-color 0.2s; }
+        #copyEmbedBtn:hover { background-color: #4a3be0; }
         @media (max-width: 768px) { .glass-bar.title-bar { width: 96%; padding: 0 16px; top: 15px; } .glass-bar.controls-bar { width: 92%; padding: 0 16px; bottom: 15px; } .video-title { font-size: 13px; max-width: 50%; } }
     </style>
 </head>
@@ -158,7 +172,7 @@ const playerTemplate = `
 
         <div class="glass-bar title-bar" id="titleBar">
             <span class="logo-text">ياسين Tv بلس</span>
-            <div class="video-title" dir="rtl"><%= match.title %> (<%= match.time %>)</div>
+            <div class="video-title" dir="rtl"><%= match.team1 %> ضد <%= match.team2 %></div>
         </div>
         
         <div id="serverPopup" class="server-popup">
@@ -189,9 +203,22 @@ const playerTemplate = `
                 </button>
             </div>
             <div class="right-controls">
+                <button class="control-icon-btn" id="embedBtn"><svg class="icon-svg" viewBox="0 0 24 24"><path d="M8.293 6.293a1 1 0 0 1 1.414 0L14.414 11H19a1 1 0 0 1 0 2h-4.586l-4.707 4.707a1 1 0 0 1-1.414-1.414L11.586 13H5a1 1 0 0 1 0-2h6.586L8.293 7.707a1 1 0 0 1 0-1.414z"/><path d="M19 19a1 1 0 1 1-2 0V5a1 1 0 0 1 2 0v14z"/></svg></button>
                 <button class="control-icon-btn" id="settingsBtn"><svg class="icon-svg" viewBox="0 0 24 24"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 0 0 .12-.61l-1.92-3.32a.488.488 0 0 0-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 0 0-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58a.49.49 0 0 0-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/></svg></button>
                 <button class="control-icon-btn" id="fullscreenBtn"><svg class="icon-svg" viewBox="0 0 24 24"><path d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z"/></svg></button>
             </div>
+        </div>
+    </div>
+
+    <!-- كود التضمين مع صلاحيات iframe لتشغيل الفيديو والصوت -->
+    <div id="embedModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>Embed Code / كود التضمين</h2>
+                <button class="close-modal" id="closeEmbedModal">&times;</button>
+            </div>
+            <textarea id="embedCodeArea" readonly><iframe src="<%= fullUrl %>" width="100%" height="500" frameborder="0" allow="autoplay; fullscreen; encrypted-media" allowfullscreen></iframe></textarea>
+            <button id="copyEmbedBtn">Copy Code / نسخ الكود</button>
         </div>
     </div>
 
@@ -216,10 +243,25 @@ const playerTemplate = `
         playerContainer.addEventListener('mousemove', resetInactivityTimer);
         playerContainer.addEventListener('touchstart', resetInactivityTimer);
 
+        // وظيفة النقر المزدوج لتكبير/تصغير الشاشة
+        playerContainer.addEventListener('dblclick', (e) => {
+            e.stopPropagation();
+            toggleFullscreen();
+        });
+
+        function toggleFullscreen() {
+            if (!document.fullscreenElement && !document.webkitFullscreenElement) {
+                if (playerContainer.requestFullscreen) playerContainer.requestFullscreen();
+                else if (playerContainer.webkitRequestFullscreen) playerContainer.webkitRequestFullscreen();
+            } else {
+                if (document.exitFullscreen) document.exitFullscreen();
+                else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+            }
+        }
+
         function showLoading() { document.getElementById('loadingOverlay').style.opacity = '1'; document.getElementById('loadingOverlay').style.pointerEvents = 'auto'; }
         function hideLoading() { document.getElementById('loadingOverlay').style.opacity = '0'; document.getElementById('loadingOverlay').style.pointerEvents = 'none'; }
 
-        // التشغيل الإجباري الصامت وإظهار أيقونة الصوت
         video.muted = true;
         function attemptPlay() {
             video.play().then(() => { 
@@ -230,7 +272,6 @@ const playerTemplate = `
             });
         }
 
-        // تفعيل الصوت وإخفاء الأيقونة عند النقر
         unmuteOverlay.addEventListener('click', (e) => {
             e.stopPropagation();
             video.muted = false;
@@ -281,18 +322,22 @@ const playerTemplate = `
 
         document.getElementById('fullscreenBtn').addEventListener('click', (e) => {
             e.stopPropagation();
-            if (!document.fullscreenElement) {
-                if (playerContainer.requestFullscreen) playerContainer.requestFullscreen();
-                else if (playerContainer.webkitRequestFullscreen) playerContainer.webkitRequestFullscreen();
-            } else {
-                if (document.exitFullscreen) document.exitFullscreen();
-                else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
-            }
+            toggleFullscreen();
         });
 
         const serverPopup = document.getElementById('serverPopup');
         document.getElementById('settingsBtn').addEventListener('click', (e) => { e.stopPropagation(); serverPopup.style.display = serverPopup.style.display === 'block' ? 'none' : 'block'; });
         document.getElementById('closeServerPopup').addEventListener('click', () => serverPopup.style.display = 'none');
+
+        const embedModal = document.getElementById('embedModal');
+        document.getElementById('embedBtn').addEventListener('click', () => embedModal.style.display = 'flex');
+        document.getElementById('closeEmbedModal').addEventListener('click', () => embedModal.style.display = 'none');
+        document.getElementById('copyEmbedBtn').addEventListener('click', () => {
+            document.getElementById('embedCodeArea').select(); 
+            document.execCommand('copy'); 
+            alert('تم نسخ كود التضمين!'); 
+            embedModal.style.display = 'none';
+        });
     </script>
 </body>
 </html>
@@ -313,7 +358,8 @@ app.get('/m', async (req, res) => {
             const matchRes = await fetchWithFallback('/ytvplus/mach');
             matches = matchRes.data;
         }
-        const matchInfo = matches.find(m => m.id_live === id_live) || { title: 'بث مباشر', league: '', time: '' };
+        
+        const matchInfo = matches.find(m => m.id_live === id_live) || { team1: 'الفريق الأول', team2: 'الفريق الثاني', title: 'بث مباشر', time: '' };
 
         let parsedServers = serverCache.get(`servers_${id_live}`);
         if (!parsedServers) {
@@ -355,7 +401,8 @@ app.get('/m', async (req, res) => {
         }
 
         const secureToken = generateSecureToken();
-        const renderedHtml = ejs.render(playerTemplate, { match: matchInfo, servers: parsedServers, id_live, token: secureToken });
+        const fullUrl = `${req.protocol}://${req.get('host')}${req.originalUrl}`;
+        const renderedHtml = ejs.render(playerTemplate, { match: matchInfo, servers: parsedServers, id_live, token: secureToken, fullUrl });
         res.send(renderedHtml);
 
     } catch (error) {
@@ -395,7 +442,6 @@ app.get('/proxy/playlist.m3u8', verifyStreamAccess, async (req, res) => {
 
         res.set({ 'Content-Type': 'application/vnd.apple.mpegurl', 'Access-Control-Allow-Origin': '*' });
         res.send(modifiedLines.join('\n'));
-
     } catch (error) {
         res.status(500).send("Playlist Error");
     }
