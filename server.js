@@ -3,66 +3,63 @@ const axios = require('axios');
 const cors = require('cors');
 const NodeCache = require('node-cache');
 const ejs = require('ejs');
-const crypto = require('crypto'); // لإنشاء التوكنات الأمنية
+const crypto = require('crypto');
 
 const app = express();
 
-// إعدادات الكاش
-const matchesCache = new NodeCache({ stdTTL: 60 });       // كاش للمباريات (60 ثانية لتحديث النتائج)
-const serverCache = new NodeCache({ stdTTL: 3600 });      // كاش لبيانات السيرفرات (ساعة)
-const tokenCache = new NodeCache({ stdTTL: 14400 });      // كاش للتوكنات الأمنية (4 ساعات)
+const matchesCache = new NodeCache({ stdTTL: 60 });
+const serverCache = new NodeCache({ stdTTL: 3600 });
+const tokenCache = new NodeCache({ stdTTL: 14400 });
 
 app.use(cors());
 
-// دوال التشفير الأساسية
 const encodeId = (id) => Buffer.from(id).toString('base64');
 const decodeId = (encoded) => Buffer.from(encoded, 'base64').toString('utf-8');
 
-// دالة إنشاء توكن أمني عشوائي
 const generateSecureToken = () => {
     const token = crypto.randomBytes(16).toString('hex');
-    tokenCache.set(token, true); // حفظ التوكن في الكاش
+    tokenCache.set(token, true);
     return token;
 };
 
-// ==========================================
-// Middleware: حماية مسارات البث (Anti-Theft)
-// ==========================================
+// دالة الجلب مع الرابط الاحتياطي
+async function fetchWithFallback(path) {
+    try {
+        return await axios.get(`https://api.kirozozo.xyz${path}`, { timeout: 8000 });
+    } catch (error) {
+        console.log(`Primary API failed for ${path}, trying fallback...`);
+        return await axios.get(`https://ytv-42qp.onrender.com${path}`, { timeout: 8000 });
+    }
+}
+
+// ميدل وير لحماية مسارات البث (يسمح بالـ Iframe بفضل إزالة شرط الـ Host)
 const verifyStreamAccess = (req, res, next) => {
     const { tk } = req.query;
-    
-    // 1. التحقق من وجود وصلاحية التوكن
     if (!tk || !tokenCache.has(tk)) {
         return res.status(403).json({ error: "Access Denied. Invalid or expired token." });
     }
-
-    // 2. التحقق من مصدر الطلب (Referer) لمنع النسخ الخارجي
-    const referer = req.headers.referer || '';
-    const host = req.get('host');
-    if (referer && !referer.includes(host)) {
-        return res.status(403).json({ error: "Direct access forbidden. Please use the official player." });
-    }
-
     next();
 };
 
 // ==========================================
-// 1. مسار الـ API (إرجاع المباريات بصيغة JSON)
+// 1. مسار الـ API (تصفية البيانات وإرجاع JSON)
 // ==========================================
 app.get('/', async (req, res) => {
     try {
         let matches = matchesCache.get('all_matches');
         
         if (!matches) {
-            const response = await axios.get('https://api.kirozozo.xyz/ytvplus/mach', { timeout: 10000 });
+            const response = await fetchWithFallback('/ytvplus/mach');
             matches = response.data.map(match => {
                 const encodedId = encodeId(match.id_live);
-                return {
+                const cleanedMatch = {
                     ...match,
-                    encodedId: encodedId,
-                    // تجهيز رابط المشغل النهائي ليسهل عليك استخدامه في موقعك
                     player_url: `${req.protocol}://${req.get('host')}/m?v=${encodedId}`
                 };
+                // حذف البيانات غير المطلوبة
+                delete cleanedMatch.id_live;
+                delete cleanedMatch.date;
+                return cleanedMatch;
             });
             matchesCache.set('all_matches', matches);
         }
@@ -75,13 +72,12 @@ app.get('/', async (req, res) => {
         });
 
     } catch (error) {
-        console.error("Error fetching matches:", error.message);
         res.status(500).json({ status: "error", message: "حدث خطأ أثناء جلب المباريات" });
     }
 });
 
 // ==========================================
-// 2. واجهة المشغل (HTML + EJS Template)
+// 2. واجهة المشغل
 // ==========================================
 const playerTemplate = `
 <!DOCTYPE html>
@@ -98,8 +94,14 @@ const playerTemplate = `
         .player-container { position: relative; width: 100%; height: 100%; max-width: 1200px; max-height: 800px; background-color: #000; overflow: hidden; cursor: default; user-select: none; -webkit-user-select: none; }
         .loading-overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0, 0, 0, 0.85); backdrop-filter: blur(10px); display: flex; flex-direction: column; justify-content: center; align-items: center; z-index: 25; transition: opacity 0.3s ease; pointer-events: auto; }
         .spinner { width: 50px; height: 50px; border: 4px solid rgba(255, 255, 255, 0.1); border-top: 4px solid #5c4dff; border-radius: 50%; animation: spin 0.8s linear infinite; margin-bottom: 12px; }
-        .loading-text { color: #fff; font-size: 15px; font-weight: 500; letter-spacing: 0.5px; }
+        .loading-text { color: #fff; font-size: 15px; font-weight: 500; }
         @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        
+        .unmute-overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0, 0, 0, 0.4); z-index: 20; display: none; flex-direction: column; justify-content: center; align-items: center; cursor: pointer; backdrop-filter: blur(2px); }
+        .unmute-btn { background: rgba(92, 77, 255, 0.9); border-radius: 50%; width: 70px; height: 70px; display: flex; justify-content: center; align-items: center; margin-bottom: 15px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); transition: transform 0.2s; animation: pulse 2s infinite; }
+        .unmute-overlay:hover .unmute-btn { transform: scale(1.1); }
+        .unmute-text { color: white; font-weight: 700; font-size: 16px; text-shadow: 0 2px 4px rgba(0,0,0,0.8); }
+
         #video { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: contain; z-index: 2; }
         .glass-bar { position: absolute; left: 50%; transform: translateX(-50%); z-index: 10; height: 58px; background: rgba(20, 22, 32, 0.78); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); border-radius: 14px; display: flex; align-items: center; justify-content: space-between; padding: 0 24px; box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5); border: 1px solid rgba(255, 255, 255, 0.08); transition: opacity 0.4s ease, transform 0.4s ease, display 0.2s ease; }
         .glass-bar.title-bar { width: 95%; max-width: 980px; height: 68px; top: 25px; }
@@ -108,43 +110,34 @@ const playerTemplate = `
         .player-container.hide-ui .glass-bar { opacity: 0; pointer-events: none; }
         .player-container.hide-ui .glass-bar.title-bar { transform: translate(-50%, -15px); }
         .player-container.hide-ui .glass-bar.controls-bar { transform: translate(-50%, 15px); }
-        .logo-text { color: #ffffff; font-size: 17px; font-weight: 700; text-decoration: none; transition: opacity 0.2s; }
+        .logo-text { color: #ffffff; font-size: 17px; font-weight: 700; text-decoration: none; }
         .video-title { color: #e5e7eb; font-size: 15px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 65%; text-align: right; }
         .left-controls { display: flex; align-items: center; gap: 8px; width: 100px; }
         .live-dot { width: 8px; height: 8px; background-color: #ff3b30; border-radius: 50%; box-shadow: 0 0 8px rgba(255, 59, 48, 0.8); animation: pulse 2s infinite; }
-        @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(255, 59, 48, 0.7); } 70% { box-shadow: 0 0 0 10px rgba(255, 59, 48, 0); } 100% { box-shadow: 0 0 0 0 rgba(255, 59, 48, 0); } }
-        .live-text { color: #ffffff; font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; }
+        @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(92, 77, 255, 0.7); } 70% { box-shadow: 0 0 0 15px rgba(92, 77, 255, 0); } 100% { box-shadow: 0 0 0 0 rgba(92, 77, 255, 0); } }
+        .live-text { color: #ffffff; font-size: 13px; font-weight: 700; text-transform: uppercase; }
         .center-controls { position: absolute; left: 50%; transform: translateX(-50%); display: flex; justify-content: center; align-items: center; }
         .play-pause-btn { width: 44px; height: 44px; background-color: #5c4dff; border: none; border-radius: 50%; display: flex; justify-content: center; align-items: center; cursor: pointer; transition: transform 0.2s ease, background-color 0.2s; box-shadow: 0 4px 12px rgba(92, 77, 255, 0.4); }
-        .play-pause-btn:hover { transform: scale(1.1); background-color: #4a3be0; }
         .play-pause-icon { fill: #ffffff; width: 18px; height: 18px; }
         .right-controls { display: flex; align-items: center; gap: 18px; width: 130px; justify-content: flex-end; }
         .control-icon-btn { background: none; border: none; cursor: pointer; display: flex; justify-content: center; align-items: center; opacity: 0.8; transition: opacity 0.2s, transform 0.2s; }
-        .control-icon-btn:hover { opacity: 1; transform: scale(1.1); }
         .icon-svg { fill: #d1d5db; width: 20px; height: 20px; }
-        .server-popup { display: none; position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 90%; max-width: 340px; background: rgba(20, 22, 35, 0.96); backdrop-filter: blur(16px); border-radius: 16px; border: 1px solid rgba(255, 255, 255, 0.12); color: white; z-index: 100; padding: 20px; box-shadow: 0 20px 50px rgba(0, 0, 0, 0.8); }
+        .server-popup { display: none; position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 90%; max-width: 340px; background: rgba(20, 22, 35, 0.96); backdrop-filter: blur(16px); border-radius: 16px; border: 1px solid rgba(255, 255, 255, 0.12); color: white; z-index: 100; padding: 20px; }
         .popup-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 14px; border-bottom: 1px solid rgba(255, 255, 255, 0.1); padding-bottom: 10px; }
         .popup-title { display: flex; flex-direction: column; }
-        .popup-title .en { font-size: 11px; color: #9ca3af; text-transform: uppercase; font-weight: 500; }
+        .popup-title .en { font-size: 11px; color: #9ca3af; text-transform: uppercase; }
         .popup-title .ar { font-size: 14px; font-weight: 700; margin-top: 2px; }
         .close-server-popup { background: none; border: none; color: #9ca3af; font-size: 20px; cursor: pointer; }
         .server-list { display: flex; flex-direction: column; gap: 6px; max-height: 250px; overflow-y: auto; }
-        .server-item { display: flex; justify-content: space-between; align-items: center; padding: 10px 14px; border-radius: 10px; cursor: pointer; transition: background-color 0.2s; }
-        .server-item:hover { background-color: rgba(255, 255, 255, 0.08); }
+        .server-item { display: flex; justify-content: space-between; align-items: center; padding: 10px 14px; border-radius: 10px; cursor: pointer; }
         .server-item.active { background-color: rgba(92, 77, 255, 0.3); border: 1px solid rgba(92, 77, 255, 0.4); }
         .server-info { display: flex; flex-direction: column; }
         .server-info .en { font-size: 13px; font-weight: 500; }
-        .server-info .ar { font-size: 12px; color: #9ca3af; margin-top: 2px; }
-        .server-item.active .server-info .en, .server-item.active .server-info .ar { color: #ffffff; }
         .check-icon { width: 18px; height: 18px; fill: #5c4dff; display: none; }
         .signal-icon { width: 16px; height: 16px; fill: #9ca3af; }
         .server-item.active .check-icon { display: block; }
         .server-item.active .signal-icon { display: none; }
-        @media (max-width: 768px) {
-            .glass-bar.title-bar { width: 96%; padding: 0 16px; top: 15px; }
-            .glass-bar.controls-bar { width: 92%; padding: 0 16px; bottom: 15px; }
-            .video-title { font-size: 13px; max-width: 50%; }
-        }
+        @media (max-width: 768px) { .glass-bar.title-bar { width: 96%; padding: 0 16px; top: 15px; } .glass-bar.controls-bar { width: 92%; padding: 0 16px; bottom: 15px; } .video-title { font-size: 13px; max-width: 50%; } }
     </style>
 </head>
 <body>
@@ -154,27 +147,29 @@ const playerTemplate = `
             <div class="loading-text">جاري الاتصال بالبث...</div>
         </div>
 
+        <div id="unmuteOverlay" class="unmute-overlay">
+            <div class="unmute-btn">
+                <svg viewBox="0 0 24 24" width="36" height="36" fill="white"><path d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06c1.38-.31 2.63-.95 3.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z"/></svg>
+            </div>
+            <span class="unmute-text">انقر لتشغيل الصوت</span>
+        </div>
+
         <video id="video" playsinline webkit-playsinline autoplay muted></video>
 
         <div class="glass-bar title-bar" id="titleBar">
             <span class="logo-text">ياسين Tv بلس</span>
-            <div class="video-title" dir="rtl"><%= match.title %> (<%= match.league %>)</div>
+            <div class="video-title" dir="rtl"><%= match.title %> (<%= match.time %>)</div>
         </div>
         
         <div id="serverPopup" class="server-popup">
             <div class="popup-header">
-                <div class="popup-title">
-                    <span class="en">SERVER SELECTION</span>
-                    <span class="ar" dir="rtl">اختر الخادم</span>
-                </div>
+                <div class="popup-title"><span class="ar" dir="rtl">اختر الخادم</span></div>
                 <button class="close-server-popup" id="closeServerPopup">&times;</button>
             </div>
             <div class="server-list">
                 <% servers.forEach(function(server, i) { %>
                     <div class="server-item <%= i === 0 ? 'active' : '' %>" onclick="changeServer(<%= server.index %>, this)">
-                        <div class="server-info">
-                            <span class="en"><%= server.name %></span>
-                        </div>
+                        <div class="server-info"><span class="en"><%= server.name %></span></div>
                         <svg class="check-icon" viewBox="0 0 24 24"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg>
                         <svg class="signal-icon" viewBox="0 0 24 24"><path d="M12 11c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm6 2c0-3.31-2.69-6-6-6s-6 2.69-6 6c0 2.22 1.21 4.15 3 5.19l1-1.74c-1.19-.7-2-1.97-2-3.45 0-2.21 1.79-4 4-4s4 1.79 4 4c0 1.48-.81 2.75-2 3.45l1 1.74c1.79-1.04 3-2.97 3-5.19Z"/></svg>
                     </div>
@@ -203,8 +198,9 @@ const playerTemplate = `
     <script>
         const video = document.getElementById('video');
         const playerContainer = document.getElementById('playerContainer');
+        const unmuteOverlay = document.getElementById('unmuteOverlay');
         const id_live = "<%= id_live %>";
-        const token = "<%= token %>"; // توكن الحماية الجلسة الحالية
+        const token = "<%= token %>";
         let hls = null;
         let inactivityTimeout;
 
@@ -223,9 +219,23 @@ const playerTemplate = `
         function showLoading() { document.getElementById('loadingOverlay').style.opacity = '1'; document.getElementById('loadingOverlay').style.pointerEvents = 'auto'; }
         function hideLoading() { document.getElementById('loadingOverlay').style.opacity = '0'; document.getElementById('loadingOverlay').style.pointerEvents = 'none'; }
 
+        // التشغيل الإجباري الصامت وإظهار أيقونة الصوت
+        video.muted = true;
         function attemptPlay() {
-            video.play().then(() => { video.muted = false; hideLoading(); }).catch(() => { video.muted = true; video.play().then(hideLoading).catch(hideLoading); });
+            video.play().then(() => { 
+                unmuteOverlay.style.display = 'flex'; 
+                hideLoading(); 
+            }).catch(() => { 
+                hideLoading(); 
+            });
         }
+
+        // تفعيل الصوت وإخفاء الأيقونة عند النقر
+        unmuteOverlay.addEventListener('click', (e) => {
+            e.stopPropagation();
+            video.muted = false;
+            unmuteOverlay.style.display = 'none';
+        });
 
         function changeServer(serverIndex, element = null) {
             showLoading();
@@ -234,35 +244,21 @@ const playerTemplate = `
                 element.classList.add('active');
             }
 
-            // إضافة التوكن السري (tk) للرابط لفك الحماية
             const manifestUrl = \`/proxy/playlist.m3u8?id=\${id_live}&s=\${serverIndex}&tk=\${token}\`;
 
             if (hls) { hls.destroy(); hls = null; }
             
             if (Hls.isSupported()) {
-                hls = new Hls({ 
-                    enableWorker: true, lowLatencyMode: true,
-                    // إعدادات لمعالجة الأخطاء الذاتية وتخطي التقطيع
-                    fragLoadingTimeOut: 15000, manifestLoadingTimeOut: 15000
-                }); 
+                hls = new Hls({ enableWorker: true, lowLatencyMode: true, fragLoadingTimeOut: 15000, manifestLoadingTimeOut: 15000 }); 
                 hls.loadSource(manifestUrl); 
                 hls.attachMedia(video);
-                
                 hls.on(Hls.Events.MANIFEST_PARSED, attemptPlay);
-                
-                // الاسترداد التلقائي في حال حدوث خطأ في البث
                 hls.on(Hls.Events.ERROR, function (event, data) {
                     if (data.fatal) {
                         switch (data.type) {
-                            case Hls.ErrorTypes.NETWORK_ERROR:
-                                hls.startLoad(); // إعادة التحميل عند خطأ الشبكة
-                                break;
-                            case Hls.ErrorTypes.MEDIA_ERROR:
-                                hls.recoverMediaError(); // إصلاح أخطاء الميديا
-                                break;
-                            default:
-                                hls.destroy();
-                                break;
+                            case Hls.ErrorTypes.NETWORK_ERROR: hls.startLoad(); break;
+                            case Hls.ErrorTypes.MEDIA_ERROR: hls.recoverMediaError(); break;
+                            default: hls.destroy(); break;
                         }
                     }
                 });
@@ -279,7 +275,7 @@ const playerTemplate = `
         const pauseIcon = document.getElementById('pauseIcon');
         const playIcon = document.getElementById('playIcon');
 
-        playPauseBtn.addEventListener('click', (e) => { e.stopPropagation(); video.muted = false; video.paused ? video.play() : video.pause(); });
+        playPauseBtn.addEventListener('click', (e) => { e.stopPropagation(); video.paused ? video.play() : video.pause(); });
         video.addEventListener('play', () => { pauseIcon.style.display = 'block'; playIcon.style.display = 'none'; resetInactivityTimer(); });
         video.addEventListener('pause', () => { pauseIcon.style.display = 'none'; playIcon.style.display = 'block'; playerContainer.classList.remove('hide-ui'); clearTimeout(inactivityTimeout); });
 
@@ -303,7 +299,7 @@ const playerTemplate = `
 `;
 
 // ==========================================
-// 3. مسار المشغل (فتح المباراة وتوليد التوكن)
+// 3. مسار المشغل
 // ==========================================
 app.get('/m', async (req, res) => {
     try {
@@ -312,25 +308,19 @@ app.get('/m', async (req, res) => {
 
         const id_live = decodeId(encodedId);
 
-        // جلب بيانات المباراة
         let matches = matchesCache.get('all_matches');
         if (!matches) {
-            const matchRes = await axios.get('https://api.kirozozo.xyz/ytvplus/mach', { timeout: 10000 });
+            const matchRes = await fetchWithFallback('/ytvplus/mach');
             matches = matchRes.data;
         }
-        const matchInfo = matches.find(m => m.id_live === id_live) || { title: 'بث مباشر', league: '', id_live };
+        const matchInfo = matches.find(m => m.id_live === id_live) || { title: 'بث مباشر', league: '', time: '' };
 
-        // جلب وتجهيز السيرفرات (كاش لمدة ساعة)
         let parsedServers = serverCache.get(`servers_${id_live}`);
         if (!parsedServers) {
-            const serversRes = await axios.get(`https://api.kirozozo.xyz/ytvplus/stream?id_live=${id_live}`, { timeout: 10000 });
+            const serversRes = await fetchWithFallback(`/ytvplus/stream?id_live=${id_live}`);
             
             parsedServers = serversRes.data.map((srv, index) => {
-                let realUrl = "";
-                let customHeaders = {};
-                let swapKey = null;
-                let swapVal = null;
-                let userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)";
+                let realUrl = "", customHeaders = {}, swapKey = null, swapVal = null, userAgent = "Mozilla/5.0";
 
                 try {
                     if (srv.data.url.startsWith('{') && srv.data.url.endsWith('}')) {
@@ -357,31 +347,24 @@ app.get('/m', async (req, res) => {
                     realUrl = srv.data.url;
                 }
 
-                // الكاش لبيانات السيرفر الداخلية فقط لكي يقرأها البروكسي
                 const serverConfig = { realUrl, customHeaders, swapKey, swapVal, name: srv.name || `سيرفر ${index + 1}` };
                 serverCache.set(`srv_${id_live}_${index}`, serverConfig); 
-                
                 return { index, name: serverConfig.name };
             });
-            
             serverCache.set(`servers_${id_live}`, parsedServers);
         }
 
-        // إنشاء توكن حماية مخصص لهذا المستخدم
         const secureToken = generateSecureToken();
-
         const renderedHtml = ejs.render(playerTemplate, { match: matchInfo, servers: parsedServers, id_live, token: secureToken });
         res.send(renderedHtml);
 
     } catch (error) {
-        console.error(error);
         res.status(500).send("حدث خطأ أثناء الاتصال بالخادم.");
     }
 });
 
 // ==========================================
-// 4. مسار البروكسي المحمي لملف (M3U8)
-// ملاحظة: يستخدم verifyStreamAccess للتحقق من التوكن والـ Referer
+// 4. مسار البروكسي لملف (M3U8)
 // ==========================================
 app.get('/proxy/playlist.m3u8', verifyStreamAccess, async (req, res) => {
     const { id, s, tk } = req.query; 
@@ -391,35 +374,26 @@ app.get('/proxy/playlist.m3u8', verifyStreamAccess, async (req, res) => {
 
     try {
         const response = await axios.get(srvConfig.realUrl, { 
-            headers: srvConfig.customHeaders,
-            responseType: 'text',
-            timeout: 10000
+            headers: srvConfig.customHeaders, responseType: 'text', timeout: 10000 
         });
 
         let m3u8 = response.data;
         const baseUrl = srvConfig.realUrl.substring(0, srvConfig.realUrl.lastIndexOf('/') + 1);
-
         const lines = m3u8.split('\n');
+        
         const modifiedLines = lines.map(line => {
             let trimmed = line.trim();
             if (!trimmed.startsWith('#') && trimmed !== '') {
-                let segmentUrl = trimmed;
-                if (!segmentUrl.startsWith('http')) {
-                    segmentUrl = baseUrl + segmentUrl;
-                }
+                let segmentUrl = trimmed.startsWith('http') ? trimmed : baseUrl + trimmed;
                 if (srvConfig.swapKey && srvConfig.swapVal !== null && segmentUrl.includes(srvConfig.swapKey)) {
                     segmentUrl = segmentUrl.replace(srvConfig.swapKey, srvConfig.swapVal);
                 }
-                // تمرير التوكن (tk) أيضاً لملفات الأجزاء لضمان استمرار الحماية
                 return `/proxy/segment.ts?id=${id}&s=${s}&tk=${tk}&url=${encodeURIComponent(segmentUrl)}`;
             }
             return line;
         });
 
-        res.set({
-            'Content-Type': 'application/vnd.apple.mpegurl',
-            'Access-Control-Allow-Origin': '*'
-        });
+        res.set({ 'Content-Type': 'application/vnd.apple.mpegurl', 'Access-Control-Allow-Origin': '*' });
         res.send(modifiedLines.join('\n'));
 
     } catch (error) {
@@ -428,7 +402,7 @@ app.get('/proxy/playlist.m3u8', verifyStreamAccess, async (req, res) => {
 });
 
 // ==========================================
-// 5. مسار البروكسي المحمي لقطع الفيديو (TS)
+// 5. مسار البروكسي لقطع الفيديو (TS)
 // ==========================================
 app.get('/proxy/segment.ts', verifyStreamAccess, async (req, res) => {
     const { id, s, url } = req.query;
@@ -438,27 +412,16 @@ app.get('/proxy/segment.ts', verifyStreamAccess, async (req, res) => {
 
     try {
         const response = await axios.get(decodeURIComponent(url), {
-            headers: srvConfig.customHeaders,
-            responseType: 'stream',
-            timeout: 15000 // وقت أطول لانتظار قطعة الفيديو
+            headers: srvConfig.customHeaders, responseType: 'stream', timeout: 15000
         });
-
-        res.set({
-            'Content-Type': 'video/MP2T',
-            'Access-Control-Allow-Origin': '*'
-        });
+        res.set({ 'Content-Type': 'video/MP2T', 'Access-Control-Allow-Origin': '*' });
         response.data.pipe(res);
     } catch (error) {
         res.status(500).send();
     }
 });
 
-// ==========================================
-// تشغيل الخادم
-// ==========================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
-    console.log(`- API Matches: http://localhost:${PORT}/`);
-    console.log(`- Test Player: http://localhost:${PORT}/m?v=${encodeId('live_tv_beinsport5')}`);
 });
