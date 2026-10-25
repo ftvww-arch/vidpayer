@@ -6,7 +6,7 @@ const ejs = require('ejs');
 const crypto = require('crypto');
 
 const app = express();
-
+app.set('trust proxy', 1); // أضف هذا السطر لكي يفهم السيرفر أنه يعمل على HTTPS
 const matchesCache = new NodeCache({ stdTTL: 60 });
 const serverCache = new NodeCache({ stdTTL: 3600 });
 const tokenCache = new NodeCache({ stdTTL: 14400 });
@@ -61,7 +61,7 @@ app.get('/', async (req, res) => {
                 const encodedId = encodeId(match.id_live);
                 const cleanedMatch = {
                     ...match,
-                    player_url: `${req.protocol}://${req.get('host')}/m?v=${encodedId}`
+                   player_url: `https://${req.get('host')}/m?v=${encodedId}`
                 };
                 delete cleanedMatch.id_live;
                 delete cleanedMatch.date;
@@ -401,7 +401,7 @@ app.get('/m', async (req, res) => {
         }
 
         const secureToken = generateSecureToken();
-        const fullUrl = `${req.protocol}://${req.get('host')}${req.originalUrl}`;
+const fullUrl = `https://${req.get('host')}${req.originalUrl}`;
         const renderedHtml = ejs.render(playerTemplate, { match: matchInfo, servers: parsedServers, id_live, token: secureToken, fullUrl });
         res.send(renderedHtml);
 
