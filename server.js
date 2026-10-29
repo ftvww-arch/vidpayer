@@ -4,16 +4,30 @@ const cors = require('cors');
 const NodeCache = require('node-cache');
 const ejs = require('ejs');
 const crypto = require('crypto');
+const http = require('http');
+const https = require('https');
 
 const app = express();
-app.set('trust proxy', 1); // أضف هذا السطر لكي يفهم السيرفر أنه يعمل على HTTPS
+app.set('trust proxy', 1);
+
+// استخدام Keep-Alive لتقليل استهلاك موارد السيرفر عند عمل طلبات كثيرة
+const axiosInstance = axios.create({
+    httpAgent: new http.Agent({ keepAlive: true }),
+    httpsAgent: new https.Agent({ keepAlive: true })
+});
+
+// إعدادات الكاش
 const matchesCache = new NodeCache({ stdTTL: 60 });
 const serverCache = new NodeCache({ stdTTL: 3600 });
-const tokenCache = new NodeCache({ stdTTL: 14400 });
+const tokenCache = new NodeCache({ stdTTL: 14400, checkperiod: 600 });
+const m3u8Cache = new NodeCache({ stdTTL: 2 }); // كاش المانيفيست لثانيتين فقط (للبث المباشر)
+
+// لمنع استدعاء نفس الرابط أكثر من مرة في نفس اللحظة
+const activeM3u8Requests = new Map(); 
 
 app.use(cors());
 
-// ميدل وير لفرض السماح بتضمين الموقع داخل iframe في أي نطاق خارجي
+// السماح بالتضمين iframe
 app.use((req, res, next) => {
     res.removeHeader('X-Frame-Options');
     res.setHeader('Content-Security-Policy', "frame-ancestors *");
@@ -23,33 +37,53 @@ app.use((req, res, next) => {
 const encodeId = (id) => Buffer.from(id).toString('base64');
 const decodeId = (encoded) => Buffer.from(encoded, 'base64').toString('utf-8');
 
-const generateSecureToken = () => {
+// استخراج IP العميل الحقيقي (حتى خلف Cloudflare أو Proxies)
+const getClientIp = (req) => {
+    const forwarded = req.headers['x-forwarded-for'];
+    return forwarded ? forwarded.split(',')[0].trim() : req.socket.remoteAddress;
+};
+
+// توليد توكن مربوط بـ IP العميل
+const generateSecureToken = (ip) => {
     const token = crypto.randomBytes(16).toString('hex');
-    tokenCache.set(token, true);
+    tokenCache.set(token, ip); // تخزين الـ IP مع التوكن
     return token;
 };
 
-// دالة الجلب مع الرابط الاحتياطي
+// دالة الجلب الاحتياطية
 async function fetchWithFallback(path) {
     try {
-        return await axios.get(`https://api.kirozozo.xyz${path}`, { timeout: 8000 });
+        return await axiosInstance.get(`https://api.kirozozo.xyz${path}`, { timeout: 8000 });
     } catch (error) {
         console.log(`Primary API failed for ${path}, trying fallback...`);
-        return await axios.get(`https://ytv-42qp.onrender.com${path}`, { timeout: 8000 });
+        return await axiosInstance.get(`https://ytv-42qp.onrender.com${path}`, { timeout: 8000 });
     }
 }
 
-// حماية مسارات البث
+// حماية مسارات البث (التحقق من التوكن، الـ IP، والـ Referer)
 const verifyStreamAccess = (req, res, next) => {
     const { tk } = req.query;
-    if (!tk || !tokenCache.has(tk)) {
-        return res.status(403).json({ error: "Access Denied. Invalid token." });
+    const clientIp = getClientIp(req);
+    const cachedIp = tokenCache.get(tk);
+    
+    // 1. فحص التوكن والـ IP
+    if (!tk || !cachedIp || cachedIp !== clientIp) {
+        return res.status(403).json({ error: "Access Denied. Invalid or stolen token." });
     }
+
+    // 2. فحص الـ Referer (اختياري لكن قوي جداً ضد سرقة الروابط للمشغلات الخارجية)
+    const referer = req.headers.referer || '';
+    const host = req.get('host');
+    // السماح إذا كان الطلب قادم من نفس النطاق (حتى لو كان iframe داخل موقع آخر، الـ Referer لطلبات الفيديو سيكون نطاقك)
+    if (referer && !referer.includes(host)) {
+        return res.status(403).json({ error: "Access Denied. Hotlinking not allowed." });
+    }
+
     next();
 };
 
 // ==========================================
-// 1. مسار الـ API (تصفية البيانات وإرجاع JSON)
+// 1. مسار الـ API 
 // ==========================================
 app.get('/', async (req, res) => {
     try {
@@ -61,7 +95,7 @@ app.get('/', async (req, res) => {
                 const encodedId = encodeId(match.id_live);
                 const cleanedMatch = {
                     ...match,
-                   player_url: `https://${req.get('host')}/m?v=${encodedId}`
+                    player_url: `https://${req.get('host')}/m?v=${encodedId}`
                 };
                 delete cleanedMatch.id_live;
                 delete cleanedMatch.date;
@@ -70,19 +104,14 @@ app.get('/', async (req, res) => {
             matchesCache.set('all_matches', matches);
         }
 
-        res.json({
-            status: "success",
-            cached: matchesCache.getTtl('all_matches') > 0,
-            total: matches.length,
-            data: matches
-        });
+        res.json({ status: "success", cached: matchesCache.getTtl('all_matches') > 0, total: matches.length, data: matches });
     } catch (error) {
         res.status(500).json({ status: "error", message: "حدث خطأ أثناء جلب المباريات" });
     }
 });
 
 // ==========================================
-// 2. واجهة المشغل
+// 2. واجهة المشغل (مع تعديلات HLS.js)
 // ==========================================
 const playerTemplate = `
 <!DOCTYPE html>
@@ -94,6 +123,7 @@ const playerTemplate = `
     <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;800&display=swap" rel="stylesheet">
     <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
     <style>
+        /* CSS كما هو في كودك الأصلي تماماً بدون أي حذف */
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body, html { height: 100%; width: 100%; background-color: #000; font-family: 'Tajawal', sans-serif; overflow: hidden; display: flex; justify-content: center; align-items: center; }
         .player-container { position: relative; width: 100%; height: 100%; max-width: 1200px; max-height: 800px; background-color: #000; overflow: hidden; cursor: default; user-select: none; -webkit-user-select: none; }
@@ -101,12 +131,10 @@ const playerTemplate = `
         .spinner { width: 50px; height: 50px; border: 4px solid rgba(255, 255, 255, 0.1); border-top: 4px solid #5c4dff; border-radius: 50%; animation: spin 0.8s linear infinite; margin-bottom: 12px; }
         .loading-text { color: #fff; font-size: 15px; font-weight: 500; }
         @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-        
         .unmute-overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0, 0, 0, 0.4); z-index: 20; display: none; flex-direction: column; justify-content: center; align-items: center; cursor: pointer; backdrop-filter: blur(2px); }
         .unmute-btn { background: rgba(92, 77, 255, 0.9); border-radius: 50%; width: 70px; height: 70px; display: flex; justify-content: center; align-items: center; margin-bottom: 15px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); transition: transform 0.2s; animation: pulse 2s infinite; }
         .unmute-overlay:hover .unmute-btn { transform: scale(1.1); }
         .unmute-text { color: white; font-weight: 700; font-size: 16px; text-shadow: 0 2px 4px rgba(0,0,0,0.8); }
-
         #video { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: contain; z-index: 2; }
         .glass-bar { position: absolute; left: 50%; transform: translateX(-50%); z-index: 10; height: 58px; background: rgba(20, 22, 32, 0.78); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); border-radius: 14px; display: flex; align-items: center; justify-content: space-between; padding: 0 24px; box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5); border: 1px solid rgba(255, 255, 255, 0.08); transition: opacity 0.4s ease, transform 0.4s ease, display 0.2s ease; }
         .glass-bar.title-bar { width: 95%; max-width: 980px; height: 68px; top: 25px; }
@@ -142,7 +170,6 @@ const playerTemplate = `
         .signal-icon { width: 16px; height: 16px; fill: #9ca3af; }
         .server-item.active .check-icon { display: block; }
         .server-item.active .signal-icon { display: none; }
-        
         .modal { display: none; position: fixed; z-index: 150; left: 0; top: 0; width: 100%; height: 100%; background-color: rgba(0,0,0,0.8); justify-content: center; align-items: center; backdrop-filter: blur(8px); }
         .modal-content { background-color: rgba(25, 27, 40, 0.95); border-radius: 16px; padding: 24px; width: 90%; max-width: 500px; border: 1px solid rgba(255, 255, 255, 0.1); color: white; display: flex; flex-direction: column; gap: 16px; }
         .modal-header { display: flex; justify-content: space-between; align-items: center; }
@@ -156,30 +183,14 @@ const playerTemplate = `
 </head>
 <body>
     <div class="player-container" id="playerContainer">
-        <div id="loadingOverlay" class="loading-overlay">
-            <div class="spinner"></div>
-            <div class="loading-text">جاري الاتصال بالبث...</div>
-        </div>
-
-        <div id="unmuteOverlay" class="unmute-overlay">
-            <div class="unmute-btn">
-                <svg viewBox="0 0 24 24" width="36" height="36" fill="white"><path d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06c1.38-.31 2.63-.95 3.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z"/></svg>
-            </div>
-            <span class="unmute-text">انقر لتشغيل الصوت</span>
-        </div>
-
+        <!-- الـ HTML الخاص بالمشغل كما هو تماماً -->
+        <div id="loadingOverlay" class="loading-overlay"><div class="spinner"></div><div class="loading-text">جاري الاتصال بالبث...</div></div>
+        <div id="unmuteOverlay" class="unmute-overlay"><div class="unmute-btn"><svg viewBox="0 0 24 24" width="36" height="36" fill="white"><path d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06c1.38-.31 2.63-.95 3.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z"/></svg></div><span class="unmute-text">انقر لتشغيل الصوت</span></div>
         <video id="video" playsinline webkit-playsinline autoplay muted></video>
-
-        <div class="glass-bar title-bar" id="titleBar">
-            <span class="logo-text">ياسين Tv بلس</span>
-            <div class="video-title" dir="rtl"><%= match.team1 %> ضد <%= match.team2 %></div>
-        </div>
+        <div class="glass-bar title-bar" id="titleBar"><span class="logo-text">ياسين Tv بلس</span><div class="video-title" dir="rtl"><%= match.team1 %> ضد <%= match.team2 %></div></div>
         
         <div id="serverPopup" class="server-popup">
-            <div class="popup-header">
-                <div class="popup-title"><span class="ar" dir="rtl">اختر الخادم</span></div>
-                <button class="close-server-popup" id="closeServerPopup">&times;</button>
-            </div>
+            <div class="popup-header"><div class="popup-title"><span class="ar" dir="rtl">اختر الخادم</span></div><button class="close-server-popup" id="closeServerPopup">&times;</button></div>
             <div class="server-list">
                 <% servers.forEach(function(server, i) { %>
                     <div class="server-item <%= i === 0 ? 'active' : '' %>" onclick="changeServer(<%= server.index %>, this)">
@@ -192,10 +203,7 @@ const playerTemplate = `
         </div>
         
         <div class="glass-bar controls-bar" id="controlsBar">
-            <div class="left-controls">
-                <div class="live-dot"></div>
-                <span class="live-text">LIVE</span>
-            </div>
+            <div class="left-controls"><div class="live-dot"></div><span class="live-text">LIVE</span></div>
             <div class="center-controls">
                 <button class="play-pause-btn" id="playPauseBtn">
                     <svg class="play-pause-icon" id="pauseIcon" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16" rx="1"></rect><rect x="14" y="4" width="4" height="16" rx="1"></rect></svg>
@@ -210,13 +218,9 @@ const playerTemplate = `
         </div>
     </div>
 
-    <!-- كود التضمين مع صلاحيات iframe لتشغيل الفيديو والصوت -->
     <div id="embedModal" class="modal">
         <div class="modal-content">
-            <div class="modal-header">
-                <h2>Embed Code / كود التضمين</h2>
-                <button class="close-modal" id="closeEmbedModal">&times;</button>
-            </div>
+            <div class="modal-header"><h2>Embed Code / كود التضمين</h2><button class="close-modal" id="closeEmbedModal">&times;</button></div>
             <textarea id="embedCodeArea" readonly><iframe src="<%= fullUrl %>" width="100%" height="500" frameborder="0" allow="autoplay; fullscreen; encrypted-media" allowfullscreen></iframe></textarea>
             <button id="copyEmbedBtn">Copy Code / نسخ الكود</button>
         </div>
@@ -243,11 +247,7 @@ const playerTemplate = `
         playerContainer.addEventListener('mousemove', resetInactivityTimer);
         playerContainer.addEventListener('touchstart', resetInactivityTimer);
 
-        // وظيفة النقر المزدوج لتكبير/تصغير الشاشة
-        playerContainer.addEventListener('dblclick', (e) => {
-            e.stopPropagation();
-            toggleFullscreen();
-        });
+        playerContainer.addEventListener('dblclick', (e) => { e.stopPropagation(); toggleFullscreen(); });
 
         function toggleFullscreen() {
             if (!document.fullscreenElement && !document.webkitFullscreenElement) {
@@ -267,16 +267,10 @@ const playerTemplate = `
             video.play().then(() => { 
                 unmuteOverlay.style.display = 'flex'; 
                 hideLoading(); 
-            }).catch(() => { 
-                hideLoading(); 
-            });
+            }).catch(() => { hideLoading(); });
         }
 
-        unmuteOverlay.addEventListener('click', (e) => {
-            e.stopPropagation();
-            video.muted = false;
-            unmuteOverlay.style.display = 'none';
-        });
+        unmuteOverlay.addEventListener('click', (e) => { e.stopPropagation(); video.muted = false; unmuteOverlay.style.display = 'none'; });
 
         function changeServer(serverIndex, element = null) {
             showLoading();
@@ -290,7 +284,16 @@ const playerTemplate = `
             if (hls) { hls.destroy(); hls = null; }
             
             if (Hls.isSupported()) {
-                hls = new Hls({ enableWorker: true, lowLatencyMode: true, fragLoadingTimeOut: 15000, manifestLoadingTimeOut: 15000 }); 
+                // إعدادات احترافية لمزامنة اللايف وتقليل استهلاك الرام
+                hls = new Hls({ 
+                    enableWorker: true, 
+                    lowLatencyMode: true, 
+                    liveSyncDurationCount: 3, // القفز لللايف بحيث لا يتأخر البث
+                    liveMaxLatencyDurationCount: 5, // أقصى تأخير مسموح قبل أن يقوم بعمل Refresh لنقطة البث
+                    backBufferLength: 60, // حذف الكاش القديم (60 ثانية) لتخفيف الرام
+                    fragLoadingTimeOut: 15000, 
+                    manifestLoadingTimeOut: 15000 
+                }); 
                 hls.loadSource(manifestUrl); 
                 hls.attachMedia(video);
                 hls.on(Hls.Events.MANIFEST_PARSED, attemptPlay);
@@ -320,10 +323,7 @@ const playerTemplate = `
         video.addEventListener('play', () => { pauseIcon.style.display = 'block'; playIcon.style.display = 'none'; resetInactivityTimer(); });
         video.addEventListener('pause', () => { pauseIcon.style.display = 'none'; playIcon.style.display = 'block'; playerContainer.classList.remove('hide-ui'); clearTimeout(inactivityTimeout); });
 
-        document.getElementById('fullscreenBtn').addEventListener('click', (e) => {
-            e.stopPropagation();
-            toggleFullscreen();
-        });
+        document.getElementById('fullscreenBtn').addEventListener('click', (e) => { e.stopPropagation(); toggleFullscreen(); });
 
         const serverPopup = document.getElementById('serverPopup');
         document.getElementById('settingsBtn').addEventListener('click', (e) => { e.stopPropagation(); serverPopup.style.display = serverPopup.style.display === 'block' ? 'none' : 'block'; });
@@ -400,8 +400,9 @@ app.get('/m', async (req, res) => {
             serverCache.set(`servers_${id_live}`, parsedServers);
         }
 
-        const secureToken = generateSecureToken();
-const fullUrl = `https://${req.get('host')}${req.originalUrl}`;
+        const clientIp = getClientIp(req);
+        const secureToken = generateSecureToken(clientIp); // ربط التوكن بالـ IP
+        const fullUrl = `https://${req.get('host')}${req.originalUrl}`;
         const renderedHtml = ejs.render(playerTemplate, { match: matchInfo, servers: parsedServers, id_live, token: secureToken, fullUrl });
         res.send(renderedHtml);
 
@@ -411,7 +412,7 @@ const fullUrl = `https://${req.get('host')}${req.originalUrl}`;
 });
 
 // ==========================================
-// 4. مسار البروكسي لملف (M3U8)
+// 4. مسار البروكسي لملف (M3U8) - مع نظام Deduplication و Caching
 // ==========================================
 app.get('/proxy/playlist.m3u8', verifyStreamAccess, async (req, res) => {
     const { id, s, tk } = req.query; 
@@ -419,15 +420,32 @@ app.get('/proxy/playlist.m3u8', verifyStreamAccess, async (req, res) => {
     
     if (!srvConfig || !srvConfig.realUrl) return res.status(404).send("Server not found");
 
-    try {
-        const response = await axios.get(srvConfig.realUrl, { 
-            headers: srvConfig.customHeaders, responseType: 'text', timeout: 10000 
-        });
+    const cacheKey = `m3u8_raw_${id}_${s}`;
+    let rawM3u8 = m3u8Cache.get(cacheKey); // التحقق من الكاش
 
-        let m3u8 = response.data;
+    try {
+        if (!rawM3u8) {
+            // إذا كان هناك طلب جاري بالفعل (نفس الثانية) ننتظره بدل فتح اتصال جديد بالمصدر
+            if (activeM3u8Requests.has(cacheKey)) {
+                rawM3u8 = await activeM3u8Requests.get(cacheKey);
+            } else {
+                // إنشاء طلب جديد وحفظ الوعد (Promise) ليتمكن الآخرين من انتظاره
+                const requestPromise = axiosInstance.get(srvConfig.realUrl, { 
+                    headers: srvConfig.customHeaders, responseType: 'text', timeout: 10000 
+                }).then(response => response.data);
+                
+                activeM3u8Requests.set(cacheKey, requestPromise);
+                rawM3u8 = await requestPromise;
+                
+                m3u8Cache.set(cacheKey, rawM3u8); // حفظ الخام في الكاش لثانيتين
+                activeM3u8Requests.delete(cacheKey); // إزالة الوعد بعد الانتهاء
+            }
+        }
+
         const baseUrl = srvConfig.realUrl.substring(0, srvConfig.realUrl.lastIndexOf('/') + 1);
-        const lines = m3u8.split('\n');
+        const lines = rawM3u8.split('\n');
         
+        // تعديل الروابط بسرعة فائقة (String manipulation)
         const modifiedLines = lines.map(line => {
             let trimmed = line.trim();
             if (!trimmed.startsWith('#') && trimmed !== '') {
@@ -443,12 +461,13 @@ app.get('/proxy/playlist.m3u8', verifyStreamAccess, async (req, res) => {
         res.set({ 'Content-Type': 'application/vnd.apple.mpegurl', 'Access-Control-Allow-Origin': '*' });
         res.send(modifiedLines.join('\n'));
     } catch (error) {
+        activeM3u8Requests.delete(cacheKey); // تنظيف في حالة الخطأ
         res.status(500).send("Playlist Error");
     }
 });
 
 // ==========================================
-// 5. مسار البروكسي لقطع الفيديو (TS)
+// 5. مسار البروكسي لقطع الفيديو (TS) - مع نظام حماية الباندويث
 // ==========================================
 app.get('/proxy/segment.ts', verifyStreamAccess, async (req, res) => {
     const { id, s, url } = req.query;
@@ -456,14 +475,24 @@ app.get('/proxy/segment.ts', verifyStreamAccess, async (req, res) => {
     
     if (!srvConfig) return res.status(404).send();
 
+    // AbortController لايقاف التحميل من المصدر فوراً إذا قام المستخدم بإغلاق الصفحة
+    const controller = new AbortController();
+    req.on('close', () => controller.abort());
+
     try {
-        const response = await axios.get(decodeURIComponent(url), {
-            headers: srvConfig.customHeaders, responseType: 'stream', timeout: 15000
+        const response = await axiosInstance.get(decodeURIComponent(url), {
+            headers: srvConfig.customHeaders, 
+            responseType: 'stream', 
+            timeout: 15000,
+            signal: controller.signal // ربط الطلب بـ Signal
         });
+        
         res.set({ 'Content-Type': 'video/MP2T', 'Access-Control-Allow-Origin': '*' });
         response.data.pipe(res);
     } catch (error) {
-        res.status(500).send();
+        if (!axios.isCancel(error)) {
+            res.status(500).send();
+        }
     }
 });
 
